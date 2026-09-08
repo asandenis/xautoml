@@ -1,17 +1,53 @@
-import { useCallback, useId, useRef, useState, type DragEvent, type ChangeEvent } from 'react'
-
-type StageId = 'detect' | 'clean' | 'automl' | 'explain'
-
-type UploadedFile = {
-  id: string
-  file: File
-  name: string
-  size: number
-  ext: string
-  kind: FileKind
-}
-
-type FileKind = 'table' | 'document' | 'image' | 'audio' | 'other'
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type DragEvent,
+} from 'react'
+import { AuthModal } from './AuthModal'
+import {
+  cloudReady,
+  getProfileStorage,
+  logout as logoutCloud,
+  restoreSession,
+  type AuthSession,
+} from './lib/auth'
+import {
+  clearUploads,
+  loadUploads,
+  syncUploads,
+  validateIncoming,
+} from './lib/fileStore'
+import {
+  ACCEPT_ATTR,
+  FILE_SECTIONS,
+  type FileKind,
+  type UploadedFile,
+  formatBytes,
+  groupByKind,
+  isAccepted,
+} from './lib/files'
+import {
+  QUOTAS,
+  buildUsage,
+  estimateRunResources,
+  formatStorage,
+  type ResourceMeter,
+  type UsageSnapshot,
+} from './lib/quotas'
+import {
+  countRunsToday,
+  createRunId,
+  dummyResultFor,
+  getLatestRun,
+  listRuns,
+  saveRun,
+  type RunRecord,
+  type StageId,
+} from './lib/runs'
 
 const STAGES: { id: StageId; index: string; label: string }[] = [
   { id: 'detect', index: '01', label: 'Detect' },
@@ -20,47 +56,9 @@ const STAGES: { id: StageId; index: string; label: string }[] = [
   { id: 'explain', index: '04', label: 'Explain' },
 ]
 
-const ACCEPTED_EXTENSIONS = [
-  'csv',
-  'tsv',
-  'xls',
-  'xlsx',
-  'parquet',
-  'json',
-  'pdf',
-  'doc',
-  'docx',
-  'odt',
-  'txt',
-  'rtf',
-  'jpg',
-  'jpeg',
-  'png',
-  'gif',
-  'webp',
-  'bmp',
-  'mp3',
-  'wav',
-  'flac',
-  'ogg',
-  'm4a',
-] as const
+const PIPELINE_ORDER: StageId[] = ['detect', 'clean', 'automl', 'explain']
 
-const ACCEPT_ATTR = ACCEPTED_EXTENSIONS.map((ext) => `.${ext}`).join(',')
-
-const TABLE_EXTS = new Set(['csv', 'tsv', 'xls', 'xlsx', 'parquet', 'json'])
-const DOC_EXTS = new Set(['pdf', 'doc', 'docx', 'odt', 'txt', 'rtf'])
-const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'])
-const AUDIO_EXTS = new Set(['mp3', 'wav', 'flac', 'ogg', 'm4a'])
-
-const DEMO_DATASET = {
-  rows: 12_480,
-  cols: 14,
-  task: 'Binary classification',
-  target: 'churned',
-}
-
-const COLUMNS = [
+const DEMO_COLUMNS = [
   { name: 'customer_id', type: 'id', missing: '0%', note: 'Unique key' },
   { name: 'tenure_months', type: 'numeric', missing: '0.2%', note: 'Right-skewed' },
   { name: 'monthly_charge', type: 'numeric', missing: '1.1%', note: 'Currency' },
@@ -71,105 +69,165 @@ const COLUMNS = [
   { name: 'churned', type: 'boolean', missing: '0%', note: 'Target' },
 ]
 
-const CLEAN_STEPS = [
-  { action: 'Drop', detail: 'customer_id — identifier, no predictive value' },
-  { action: 'Impute', detail: 'median for tenure_months, monthly_charge, last_login_days' },
-  { action: 'Encode', detail: 'one-hot contract_type, region' },
-  { action: 'Scale', detail: 'standardize numeric features' },
-  { action: 'Split', detail: '70 / 15 / 15 train · val · test, stratified on churned' },
-]
-
-const MODELS = [
-  { name: 'Gradient Boosting', auc: 0.912, f1: 0.84, status: 'best' as const },
-  { name: 'Random Forest', auc: 0.894, f1: 0.81, status: 'ok' as const },
-  { name: 'Logistic Regression', auc: 0.861, f1: 0.76, status: 'ok' as const },
-  { name: 'SVM (RBF)', auc: 0.848, f1: 0.74, status: 'ok' as const },
-]
-
-const FEATURES = [
-  { name: 'last_login_days', weight: 0.28 },
-  { name: 'monthly_charge', weight: 0.21 },
-  { name: 'support_tickets', weight: 0.17 },
-  { name: 'contract_type=month-to-month', weight: 0.14 },
-  { name: 'tenure_months', weight: 0.11 },
-]
-
-function extensionOf(name: string) {
-  const parts = name.toLowerCase().split('.')
-  return parts.length > 1 ? parts.at(-1)! : ''
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function kindOf(ext: string): FileKind {
-  if (TABLE_EXTS.has(ext)) return 'table'
-  if (DOC_EXTS.has(ext)) return 'document'
-  if (IMAGE_EXTS.has(ext)) return 'image'
-  if (AUDIO_EXTS.has(ext)) return 'audio'
-  return 'other'
+function countByKind(files: UploadedFile[]) {
+  return FILE_SECTIONS.reduce(
+    (acc, section) => {
+      acc[section.kind] = files.filter((f) => f.kind === section.kind).length
+      return acc
+    },
+    {} as Record<FileKind, number>,
+  )
 }
 
-function isAccepted(file: File) {
-  const ext = extensionOf(file.name)
-  return (ACCEPTED_EXTENSIONS as readonly string[]).includes(ext)
+function UsagePanel({ usage, meter, running }: {
+  usage: UsageSnapshot | null
+  meter: ResourceMeter | null
+  running: boolean
+}) {
+  if (!usage) return null
+  return (
+    <section className="usage-panel">
+      <div className="usage-grid">
+        <div className="usage-block">
+          <p className="kicker">Storage</p>
+          <div className="meter-head">
+            <strong>{formatStorage(usage.storageUsed)}</strong>
+            <span className="muted">/ {formatStorage(usage.storageLimit)}</span>
+          </div>
+          <div className="meter-track">
+            <div className="meter-fill" style={{ width: `${usage.storagePct}%` }} />
+          </div>
+          <p className="meter-sub">
+            {usage.fileCount}/{usage.fileLimit} files · free-tier cap
+          </p>
+        </div>
+        <div className="usage-block">
+          <p className="kicker">Runs today</p>
+          <div className="meter-head">
+            <strong>{usage.runsToday}</strong>
+            <span className="muted">/ {usage.runsPerDayLimit}</span>
+          </div>
+          <div className="meter-track">
+            <div
+              className="meter-fill"
+              style={{
+                width: `${Math.min(100, (usage.runsToday / usage.runsPerDayLimit) * 100)}%`,
+              }}
+            />
+          </div>
+          <p className="meter-sub">Resets at local midnight</p>
+        </div>
+        <div className="usage-block">
+          <p className="kicker">{running ? 'Live resources' : 'Last resources'}</p>
+          {meter ? (
+            <>
+              <div className="meter-head">
+                <strong>{meter.memoryMb} MB</strong>
+                <span className="muted">est. RAM · {meter.stageLabel}</span>
+              </div>
+              <div className="meter-track">
+                <div
+                  className="meter-fill is-compute"
+                  style={{
+                    width: `${Math.min(100, (meter.computeUnits / meter.computeLimit) * 100)}%`,
+                  }}
+                />
+              </div>
+              <p className="meter-sub">
+                Compute {meter.computeUnits}/{meter.computeLimit} units
+              </p>
+            </>
+          ) : (
+            <p className="meter-sub">Run a pipeline to sample resource use.</p>
+          )}
+        </div>
+      </div>
+    </section>
+  )
 }
 
-function formatBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+function RunsHistory({
+  runs,
+  activeId,
+  onSelect,
+}: {
+  runs: RunRecord[]
+  activeId?: string
+  onSelect: (run: RunRecord) => void
+}) {
+  return (
+    <section className="runs-history">
+      <div className="file-list-head">
+        <p className="kicker">Past runs · {runs.length}</p>
+      </div>
+      {runs.length === 0 ? (
+        <p className="file-section-empty">No saved runs yet.</p>
+      ) : (
+        <ul className="runs-list">
+          {runs.map((run) => (
+            <li key={run.id}>
+              <button
+                type="button"
+                className={`run-item${activeId === run.id ? ' is-active' : ''}`}
+                onClick={() => onSelect(run)}
+              >
+                <span className="run-item-id">{run.id}</span>
+                <span className="run-item-meta">
+                  {run.status} · {run.stage} · {run.fileCount} files
+                </span>
+                <span className="run-item-date">
+                  {new Date(run.createdAt).toLocaleString()}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  )
 }
 
-function fileKey(file: File) {
-  return `${file.name}::${file.size}::${file.lastModified}`
-}
-
-function StageDetect({ files }: { files: UploadedFile[] }) {
-  const primary = files[0]
-  const kinds = [...new Set(files.map((f) => f.kind))]
+function StageDetect({ files, run }: { files: UploadedFile[]; run: RunRecord | null }) {
+  const counts = countByKind(files)
+  const primary = files.find((f) => f.kind === 'numerical') ?? files[0]
+  const detect = (run?.result?.detect as { task?: string; target?: string } | undefined) ?? {
+    task: 'Binary classification',
+    target: 'churned',
+  }
 
   return (
     <div className="panel-grid">
       <section className="block">
-        <p className="kicker">Dataset</p>
-        <h2 className="block-title">{files.length === 1 ? primary.name : `${files.length} files`}</h2>
+        <p className="kicker">Library</p>
+        <h2 className="block-title">
+          {files.length === 1 ? primary?.name : `${files.length} files sorted`}
+        </h2>
         <dl className="meta-list">
-          <div>
-            <dt>Files</dt>
-            <dd>{files.length}</dd>
-          </div>
-          <div>
-            <dt>Total size</dt>
-            <dd>{formatBytes(files.reduce((sum, f) => sum + f.size, 0))}</dd>
-          </div>
-          <div>
-            <dt>Modalities</dt>
-            <dd>{kinds.join(' · ')}</dd>
-          </div>
+          {FILE_SECTIONS.map((section) => (
+            <div key={section.kind}>
+              <dt>{section.title}</dt>
+              <dd>{counts[section.kind]}</dd>
+            </div>
+          ))}
           <div>
             <dt>Inferred task</dt>
-            <dd>{DEMO_DATASET.task}</dd>
+            <dd>{detect.task}</dd>
           </div>
           <div>
             <dt>Target</dt>
             <dd>
-              <code>{DEMO_DATASET.target}</code>
+              <code>{detect.target}</code>
             </dd>
           </div>
         </dl>
       </section>
-
       <section className="block block-grow">
         <p className="kicker">Schema</p>
         <h2 className="block-title">Detected columns</h2>
-        <p className="note note-tight">
-          Hard-coded preview from tabular signal
-          {primary ? (
-            <>
-              {' '}
-              in <code>{primary.name}</code>
-            </>
-          ) : null}
-          .
-        </p>
         <div className="table-wrap">
           <table className="data-table">
             <thead>
@@ -181,7 +239,7 @@ function StageDetect({ files }: { files: UploadedFile[] }) {
               </tr>
             </thead>
             <tbody>
-              {COLUMNS.map((col) => (
+              {DEMO_COLUMNS.map((col) => (
                 <tr key={col.name}>
                   <td>
                     <code>{col.name}</code>
@@ -199,107 +257,64 @@ function StageDetect({ files }: { files: UploadedFile[] }) {
   )
 }
 
-function StageClean() {
+function StageClean({ run }: { run: RunRecord | null }) {
+  const clean = run?.result?.clean as { features?: number; trainRows?: number } | undefined
   return (
     <div className="panel-grid">
       <section className="block">
         <p className="kicker">Transforms</p>
         <h2 className="block-title">Applied pipeline</h2>
-        <ol className="action-list">
-          {CLEAN_STEPS.map((step, i) => (
-            <li key={step.action + i}>
-              <span className="action-tag">{step.action}</span>
-              <span>{step.detail}</span>
-            </li>
-          ))}
-        </ol>
+        <p className="note">Dummy cleaning for run {run?.id ?? '—'}</p>
+        <dl className="meta-list">
+          <div>
+            <dt>Features</dt>
+            <dd>{clean?.features ?? 22}</dd>
+          </div>
+          <div>
+            <dt>Train rows</dt>
+            <dd>{clean?.trainRows?.toLocaleString() ?? '8,736'}</dd>
+          </div>
+        </dl>
       </section>
-
       <section className="block">
         <p className="kicker">Output</p>
         <h2 className="block-title">Feature matrix</h2>
+        <p className="note">Impute · encode · scale · stratified split (dummy).</p>
+      </section>
+    </div>
+  )
+}
+
+function StageAutoml({ run }: { run: RunRecord | null }) {
+  const automl = run?.result?.automl as
+    | { bestModel?: string; auc?: number; f1?: number }
+    | undefined
+  return (
+    <div className="panel-stack">
+      <section className="block">
+        <p className="kicker">Model search</p>
+        <h2 className="block-title">{automl?.bestModel ?? 'Gradient Boosting'}</h2>
         <dl className="meta-list">
           <div>
-            <dt>Train rows</dt>
-            <dd>8,736</dd>
+            <dt>AUC</dt>
+            <dd>
+              <code>{(automl?.auc ?? 0.912).toFixed(3)}</code>
+            </dd>
           </div>
           <div>
-            <dt>Val / test</dt>
-            <dd>1,872 / 1,872</dd>
-          </div>
-          <div>
-            <dt>Features</dt>
-            <dd>22 after encoding</dd>
-          </div>
-          <div>
-            <dt>Class balance</dt>
-            <dd>26.4% positive</dd>
+            <dt>F1</dt>
+            <dd>
+              <code>{(automl?.f1 ?? 0.84).toFixed(2)}</code>
+            </dd>
           </div>
         </dl>
-        <p className="note">
-          Missing values filled. Categoricals expanded. Ready for model search.
-        </p>
       </section>
     </div>
   )
 }
 
-function StageAutoml() {
-  return (
-    <div className="panel-grid">
-      <section className="block block-grow">
-        <p className="kicker">Model search</p>
-        <h2 className="block-title">Leaderboard</h2>
-        <div className="table-wrap">
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Model</th>
-                <th>AUC</th>
-                <th>F1</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {MODELS.map((model) => (
-                <tr key={model.name} className={model.status === 'best' ? 'is-best' : undefined}>
-                  <td>{model.name}</td>
-                  <td>
-                    <code>{model.auc.toFixed(3)}</code>
-                  </td>
-                  <td>
-                    <code>{model.f1.toFixed(2)}</code>
-                  </td>
-                  <td className="muted">{model.status === 'best' ? 'selected' : ''}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <section className="block">
-        <p className="kicker">Importance</p>
-        <h2 className="block-title">Top drivers</h2>
-        <ul className="bar-list">
-          {FEATURES.map((f) => (
-            <li key={f.name}>
-              <div className="bar-label">
-                <code>{f.name}</code>
-                <span>{Math.round(f.weight * 100)}%</span>
-              </div>
-              <div className="bar-track">
-                <div className="bar-fill" style={{ width: `${f.weight * 100}%` }} />
-              </div>
-            </li>
-          ))}
-        </ul>
-      </section>
-    </div>
-  )
-}
-
-function StageExplain() {
+function StageExplain({ run }: { run: RunRecord | null }) {
+  const explain = run?.result?.explain as { narrative?: string } | undefined
   return (
     <div className="panel-stack">
       <section className="block">
@@ -307,31 +322,72 @@ function StageExplain() {
         <h2 className="block-title">Result narrative</h2>
         <div className="prose">
           <p>
-            This looks like a <strong>churn prediction</strong> problem. The best model is{' '}
-            <strong>Gradient Boosting</strong> (AUC 0.912, F1 0.84 on the held-out test set).
+            {explain?.narrative ??
+              'Dummy explanation — churn risk rises with inactivity and support load.'}
           </p>
-          <p>
-            Churn risk rises sharply when customers go quiet:{' '}
-            <code>last_login_days</code> is the strongest signal, followed by higher{' '}
-            <code>monthly_charge</code> and frequent <code>support_tickets</code>. Month-to-month
-            contracts also elevate risk versus annual plans.
-          </p>
-          <p>
-            Treat high-score accounts with outreach before day-30 inactivity. The model is strong
-            but not perfect—false positives cluster among new high-ARPU users in the first 90 days
-            of tenure.
-          </p>
+          <p className="muted">Run {run?.id ?? '—'}</p>
         </div>
       </section>
+    </div>
+  )
+}
 
-      <section className="block">
-        <p className="kicker">Caveats</p>
-        <ul className="plain-list">
-          <li>Target leakage check passed — no post-churn fields in features.</li>
-          <li>Region has mild imbalance; calibration may drift for rare regions.</li>
-          <li>3.4% missing on last_login_days was median-imputed — monitor online.</li>
-        </ul>
-      </section>
+function FileSections({
+  files,
+  onRemove,
+  onClear,
+}: {
+  files: UploadedFile[]
+  onRemove: (id: string) => void
+  onClear: () => void
+}) {
+  const sections = groupByKind(files)
+  return (
+    <div className="file-sections">
+      <div className="file-list-head">
+        <p className="kicker">
+          Cloud library · {files.length} file{files.length === 1 ? '' : 's'}
+        </p>
+        <button type="button" className="text-btn" onClick={onClear}>
+          Clear all
+        </button>
+      </div>
+      <div className="section-grid">
+        {sections.map((section) => (
+          <section key={section.kind} className="file-section">
+            <header className="file-section-head">
+              <div>
+                <h3 className="file-section-title">{section.title}</h3>
+                <p className="file-section-hint">{section.hint}</p>
+              </div>
+              <span className="file-section-count">{section.files.length}</span>
+            </header>
+            {section.files.length === 0 ? (
+              <p className="file-section-empty">No files yet</p>
+            ) : (
+              <ul className="file-list">
+                {section.files.map((f) => (
+                  <li key={f.id}>
+                    <span className="file-ext">{f.ext}</span>
+                    <span className="file-name" title={f.name}>
+                      {f.name}
+                    </span>
+                    <span className="file-size">{formatBytes(f.size)}</span>
+                    <button
+                      type="button"
+                      className="text-btn"
+                      aria-label={`Remove ${f.name}`}
+                      onClick={() => onRemove(f.id)}
+                    >
+                      Remove
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        ))}
+      </div>
     </div>
   )
 }
@@ -341,64 +397,39 @@ function UploadZone({
   onAdd,
   onRemove,
   onClear,
+  rejectNote,
 }: {
   files: UploadedFile[]
   onAdd: (files: File[]) => void
   onRemove: (id: string) => void
   onClear: () => void
+  rejectNote: string | null
 }) {
   const inputId = useId()
   const inputRef = useRef<HTMLInputElement>(null)
   const [dragging, setDragging] = useState(false)
-  const [rejectNote, setRejectNote] = useState<string | null>(null)
 
-  const handleFiles = useCallback(
-    (list: FileList | File[]) => {
-      const incoming = Array.from(list)
-      const accepted = incoming.filter(isAccepted)
-      const rejected = incoming.length - accepted.length
-      setRejectNote(
-        rejected > 0
-          ? `${rejected} file${rejected === 1 ? '' : 's'} skipped — unsupported type`
-          : null,
-      )
-      if (accepted.length) onAdd(accepted)
-    },
-    [onAdd],
-  )
-
-  const onDragOver = (e: DragEvent) => {
-    e.preventDefault()
-    e.stopPropagation()
-    setDragging(true)
-  }
-
-  const onDragLeave = (e: DragEvent) => {
-    e.preventDefault()
-    e.stopPropagation()
-    setDragging(false)
-  }
-
-  const onDrop = (e: DragEvent) => {
-    e.preventDefault()
-    e.stopPropagation()
-    setDragging(false)
-    if (e.dataTransfer.files?.length) handleFiles(e.dataTransfer.files)
-  }
-
-  const onChange = (e: ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files?.length) handleFiles(e.target.files)
-    e.target.value = ''
+  const handleFiles = (list: FileList | File[]) => {
+    onAdd(Array.from(list).filter(isAccepted))
   }
 
   return (
     <div className="upload-block">
       <div
-        className={`upload-zone${dragging ? ' is-dragging' : ''}${files.length ? ' has-files' : ''}`}
-        onDragOver={onDragOver}
-        onDragEnter={onDragOver}
-        onDragLeave={onDragLeave}
-        onDrop={onDrop}
+        className={`upload-zone${dragging ? ' is-dragging' : ''}`}
+        onDragOver={(e: DragEvent) => {
+          e.preventDefault()
+          setDragging(true)
+        }}
+        onDragLeave={(e: DragEvent) => {
+          e.preventDefault()
+          setDragging(false)
+        }}
+        onDrop={(e: DragEvent) => {
+          e.preventDefault()
+          setDragging(false)
+          if (e.dataTransfer.files?.length) handleFiles(e.dataTransfer.files)
+        }}
       >
         <input
           ref={inputRef}
@@ -407,7 +438,10 @@ function UploadZone({
           type="file"
           multiple
           accept={ACCEPT_ATTR}
-          onChange={onChange}
+          onChange={(e: ChangeEvent<HTMLInputElement>) => {
+            if (e.target.files?.length) handleFiles(e.target.files)
+            e.target.value = ''
+          }}
         />
         <span className="upload-mark" aria-hidden="true">
           ↑
@@ -419,7 +453,8 @@ function UploadZone({
             <label htmlFor={inputId} className="upload-browse">
               browse
             </label>{' '}
-            — CSV, XLSX, PDF, DOC/DOCX, ODT, JPG, PNG, MP3, WAV, and more
+            — encrypted to Supabase · max {Math.round(QUOTAS.maxFileBytes / (1024 * 1024))} MB /
+            file
           </span>
         </div>
         <button
@@ -430,82 +465,128 @@ function UploadZone({
           Select files
         </button>
       </div>
-
       {rejectNote ? <p className="upload-warn">{rejectNote}</p> : null}
-
       {files.length > 0 ? (
-        <div className="file-list-wrap">
-          <div className="file-list-head">
-            <p className="kicker">
-              Uploaded · {files.length} file{files.length === 1 ? '' : 's'}
-            </p>
-            <button type="button" className="text-btn" onClick={onClear}>
-              Clear all
-            </button>
-          </div>
-          <ul className="file-list">
-            {files.map((f) => (
-              <li key={f.id}>
-                <span className="file-kind">{f.kind}</span>
-                <span className="file-name" title={f.name}>
-                  {f.name}
-                </span>
-                <span className="file-size">{formatBytes(f.size)}</span>
-                <button
-                  type="button"
-                  className="text-btn"
-                  aria-label={`Remove ${f.name}`}
-                  onClick={() => onRemove(f.id)}
-                >
-                  Remove
-                </button>
-              </li>
-            ))}
-          </ul>
-        </div>
+        <FileSections files={files} onRemove={onRemove} onClear={onClear} />
       ) : null}
     </div>
   )
 }
 
-function EmptyWorkspace() {
-  return (
-    <section className="empty-workspace" aria-live="polite">
-      <p className="kicker">Pipeline locked</p>
-      <h2 className="block-title">Upload data to unlock Detect, Clean, AutoML, and Explain.</h2>
-      <p className="note">
-        Add one or more files above. Until then, pipeline stages stay unavailable.
-      </p>
-    </section>
-  )
-}
-
 export default function App() {
+  const configured = cloudReady()
+  const [session, setSession] = useState<AuthSession | null>(null)
+  const [authOpen, setAuthOpen] = useState(false)
   const [files, setFiles] = useState<UploadedFile[]>([])
   const [stage, setStage] = useState<StageId>('detect')
-  const hasData = files.length > 0
+  const [ready, setReady] = useState(false)
+  const [activeRun, setActiveRun] = useState<RunRecord | null>(null)
+  const [runs, setRuns] = useState<RunRecord[]>([])
+  const [running, setRunning] = useState(false)
+  const [usage, setUsage] = useState<UsageSnapshot | null>(null)
+  const [meter, setMeter] = useState<ResourceMeter | null>(null)
+  const [rejectNote, setRejectNote] = useState<string | null>(null)
+  const [syncError, setSyncError] = useState<string | null>(null)
+  const runToken = useRef(0)
+  const pendingRun = useRef(false)
 
-  const addFiles = useCallback((incoming: File[]) => {
-    setFiles((prev) => {
-      const seen = new Set(prev.map((f) => fileKey(f.file)))
-      const next = [...prev]
-      for (const file of incoming) {
-        const key = fileKey(file)
-        if (seen.has(key)) continue
-        seen.add(key)
-        const ext = extensionOf(file.name)
-        next.push({
-          id: `${key}-${crypto.randomUUID()}`,
-          file,
-          name: file.name,
-          size: file.size,
-          ext,
-          kind: kindOf(ext),
+  const hasData = files.length > 0
+  const loggedIn = Boolean(session)
+
+  const refreshUsage = useCallback(async (userId: string, fileList: UploadedFile[]) => {
+    const [storageUsed, runsToday] = await Promise.all([
+      getProfileStorage(userId).catch(() => fileList.reduce((s, f) => s + f.size, 0)),
+      countRunsToday(userId).catch(() => 0),
+    ])
+    setUsage(
+      buildUsage(
+        Math.max(storageUsed, fileList.reduce((s, f) => s + f.size, 0)),
+        fileList.length,
+        runsToday,
+      ),
+    )
+  }, [])
+
+  const hydrateUser = useCallback(
+    async (next: AuthSession, memoryFiles: UploadedFile[] = []) => {
+      const stored = await loadUploads(next.user.id, next.dataKey)
+      const mergedMap = new Map<string, UploadedFile>()
+      for (const f of stored) mergedMap.set(f.id, f)
+      for (const f of memoryFiles) if (!mergedMap.has(f.id)) mergedMap.set(f.id, f)
+      const merged = [...mergedMap.values()]
+      const history = await listRuns(next.user.id)
+      const latest = history[0] ?? (await getLatestRun(next.user.id))
+      setFiles(merged)
+      setRuns(history)
+      setActiveRun(latest)
+      if (latest) setStage(latest.stage)
+      if (latest?.resources) {
+        setMeter({
+          memoryMb: latest.resources.peakMemoryMb,
+          memoryLimitMb: QUOTAS.maxMemoryMb,
+          computeUnits: latest.resources.computeUnits,
+          computeLimit: latest.resources.computeLimit,
+          stageLabel: latest.stage,
         })
       }
-      return next
+      await refreshUsage(next.user.id, merged)
+    },
+    [refreshUsage],
+  )
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      if (!configured) {
+        setReady(true)
+        return
+      }
+      const restored = await restoreSession()
+      if (cancelled) return
+      if (restored) {
+        setSession(restored)
+        await hydrateUser(restored)
+      }
+      if (!cancelled) setReady(true)
+    })().catch(() => {
+      if (!cancelled) setReady(true)
     })
-  }, [])
+    return () => {
+      cancelled = true
+    }
+  }, [configured, hydrateUser])
+
+  useEffect(() => {
+    if (!ready || !session) return
+    const handle = window.setTimeout(() => {
+      void syncUploads(session.user.id, session.dataKey, files)
+        .then(() => {
+          setSyncError(null)
+          return refreshUsage(session.user.id, files)
+        })
+        .catch((err) => {
+          setSyncError(err instanceof Error ? err.message : 'Sync failed')
+        })
+    }, 600)
+    return () => window.clearTimeout(handle)
+  }, [files, ready, session, refreshUsage])
+
+  const addFiles = useCallback(
+    (incoming: File[]) => {
+      if (!session) {
+        setAuthOpen(true)
+        setRejectNote('Sign in before uploading data.')
+        return
+      }
+      setFiles((prev) => {
+        const { accepted, error } = validateIncoming(prev, incoming)
+        setRejectNote(error)
+        if (!accepted.length) return prev
+        return [...prev, ...accepted]
+      })
+    },
+    [session],
+  )
 
   const removeFile = useCallback((id: string) => {
     setFiles((prev) => {
@@ -518,7 +599,146 @@ export default function App() {
   const clearFiles = useCallback(() => {
     setFiles([])
     setStage('detect')
+    if (session) void clearUploads(session.user.id).then(() => refreshUsage(session.user.id, []))
+  }, [session, refreshUsage])
+
+  const onAuthed = useCallback(
+    async (next: AuthSession) => {
+      setSession(next)
+      await hydrateUser(next, files)
+    },
+    [files, hydrateUser],
+  )
+
+  const logout = useCallback(async () => {
+    runToken.current += 1
+    setRunning(false)
+    await logoutCloud().catch(() => {})
+    setSession(null)
+    setFiles([])
+    setRuns([])
+    setActiveRun(null)
+    setUsage(null)
+    setMeter(null)
+    setStage('detect')
   }, [])
+
+  const startRun = useCallback(async () => {
+    if (!configured) return
+    if (!session) {
+      pendingRun.current = true
+      setAuthOpen(true)
+      return
+    }
+    if (!files.length || running) return
+
+    const runsToday = await countRunsToday(session.user.id)
+    if (runsToday >= QUOTAS.maxRunsPerDay) {
+      setRejectNote(`Daily run limit reached (${QUOTAS.maxRunsPerDay}/day on free tier).`)
+      await refreshUsage(session.user.id, files)
+      return
+    }
+
+    pendingRun.current = false
+    const token = ++runToken.current
+    const totalBytes = files.reduce((s, f) => s + f.size, 0)
+    const estimate = estimateRunResources(totalBytes, files.length)
+    const now = Date.now()
+    let compute = 0
+    const run: RunRecord = {
+      id: createRunId(),
+      userId: session.user.id,
+      status: 'running',
+      stage: 'detect',
+      fileCount: files.length,
+      createdAt: now,
+      updatedAt: now,
+      summary: 'Pipeline started',
+      result: {},
+      resources: {
+        peakMemoryMb: estimate.memoryMb,
+        computeUnits: 0,
+        computeLimit: estimate.computeLimit,
+        durationMs: 0,
+      },
+    }
+
+    setRunning(true)
+    setActiveRun(run)
+    setStage('detect')
+    await saveRun(run)
+
+    for (const nextStage of PIPELINE_ORDER) {
+      if (runToken.current !== token) return
+      compute = Math.min(
+        estimate.computeLimit,
+        compute + Math.round(estimate.computeLimit / PIPELINE_ORDER.length),
+      )
+      const updated: RunRecord = {
+        ...run,
+        stage: nextStage,
+        updatedAt: Date.now(),
+        summary: `Dummy ${nextStage} complete`,
+        status: nextStage === 'explain' ? 'complete' : 'running',
+        completedAt: nextStage === 'explain' ? Date.now() : undefined,
+        result: { ...run.result, [nextStage]: dummyResultFor(nextStage) },
+        resources: {
+          peakMemoryMb: estimate.memoryMb,
+          computeUnits: compute,
+          computeLimit: estimate.computeLimit,
+          durationMs: Date.now() - now,
+        },
+      }
+      Object.assign(run, updated)
+      setStage(nextStage)
+      setActiveRun({ ...updated })
+      setMeter({
+        memoryMb: estimate.memoryMb,
+        memoryLimitMb: QUOTAS.maxMemoryMb,
+        computeUnits: compute,
+        computeLimit: estimate.computeLimit,
+        stageLabel: nextStage,
+      })
+      await saveRun(updated)
+      await sleep(nextStage === 'explain' ? 650 : 1000)
+    }
+
+    if (runToken.current === token) {
+      setRunning(false)
+      const history = await listRuns(session.user.id)
+      setRuns(history)
+      await refreshUsage(session.user.id, files)
+    }
+  }, [configured, files, refreshUsage, running, session])
+
+  useEffect(() => {
+    if (!session || !pendingRun.current || !files.length || running) return
+    pendingRun.current = false
+    void startRun()
+  }, [session, files.length, running, startRun])
+
+  const selectRun = (run: RunRecord) => {
+    if (running) return
+    setActiveRun(run)
+    setStage(run.stage)
+    setMeter({
+      memoryMb: run.resources.peakMemoryMb,
+      memoryLimitMb: QUOTAS.maxMemoryMb,
+      computeUnits: run.resources.computeUnits,
+      computeLimit: run.resources.computeLimit,
+      stageLabel: run.stage,
+    })
+  }
+
+  const statusLabel = !ready
+    ? 'Restoring…'
+    : running
+      ? `Running · ${stage}`
+      : activeRun?.status === 'complete'
+        ? 'Run complete'
+        : hasData
+          ? 'Ready to run'
+          : 'Waiting for data'
 
   return (
     <div className="app">
@@ -532,36 +752,121 @@ export default function App() {
           <span className="wordmark">xAutoML</span>
           <span className="topbar-sep" aria-hidden="true" />
           <span className="run-label">Run</span>
-          <code className="run-id">{hasData ? 'run_7f3a2c' : '—'}</code>
+          <code className="run-id">{activeRun?.id ?? '—'}</code>
         </div>
-        <div className={`topbar-status${hasData ? '' : ' is-waiting'}`}>
-          <span className="status-dot" aria-hidden="true" />
-          <span>{hasData ? 'Pipeline ready' : 'Waiting for data'}</span>
+        <div className="topbar-actions">
+          <div className={`topbar-status${hasData && !running ? '' : ' is-waiting'}`}>
+            <span className="status-dot" aria-hidden="true" />
+            <span>{statusLabel}</span>
+          </div>
+          {loggedIn ? (
+            <>
+              <span className="account-chip" title={session!.user.email}>
+                {session!.user.displayName}
+              </span>
+              <button type="button" className="text-btn" onClick={logout}>
+                Sign out
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              className="btn-ghost-inline"
+              onClick={() => setAuthOpen(true)}
+              disabled={!configured}
+            >
+              Sign in
+            </button>
+          )}
         </div>
       </header>
 
       <div className="shell">
-        <UploadZone
-          files={files}
-          onAdd={addFiles}
-          onRemove={removeFile}
-          onClear={clearFiles}
-        />
+        {!configured ? (
+          <div className="auth-banner">
+            <p>
+              Connect a free Supabase project to save accounts, encrypted documents, and run
+              history. Copy `.env.example` → `.env` and run `supabase/schema.sql`.
+            </p>
+          </div>
+        ) : null}
+
+        {configured && !loggedIn ? (
+          <div className="auth-banner">
+            <p>Sign in required — you must authenticate before uploading any data.</p>
+            <button type="button" className="btn-primary" onClick={() => setAuthOpen(true)}>
+              Sign in / Register
+            </button>
+          </div>
+        ) : null}
+
+        {loggedIn ? <UsagePanel usage={usage} meter={meter} running={running} /> : null}
+        {syncError ? <p className="upload-warn">Sync: {syncError}</p> : null}
+
+        {loggedIn ? (
+          <UploadZone
+            files={files}
+            onAdd={addFiles}
+            onRemove={removeFile}
+            onClear={clearFiles}
+            rejectNote={rejectNote}
+          />
+        ) : (
+          <div className="upload-block" aria-hidden="true">
+            <div className="upload-zone is-inert">
+              <span className="upload-mark" aria-hidden="true">
+                ↑
+              </span>
+              <div className="upload-copy">
+                <strong>Upload locked</strong>
+                <span className="muted">Sign in above to enable data upload.</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="run-bar">
+          <div className="run-bar-copy">
+            <p className="kicker">Pipeline</p>
+            <p className="run-bar-title">
+              {running
+                ? `Executing ${stage}…`
+                : !loggedIn
+                  ? 'Sign in to upload and run'
+                  : hasData
+                    ? 'Run clean → AutoML → explain'
+                    : 'Upload data to enable Run'}
+            </p>
+          </div>
+          <button
+            type="button"
+            className="btn-primary run-btn"
+            disabled={!configured || !hasData || running}
+            onClick={startRun}
+          >
+            {running ? 'Running…' : 'Run'}
+          </button>
+        </div>
 
         <nav className="stage-nav" aria-label="Pipeline stages">
           {STAGES.map((s) => {
             const locked = !hasData
+            const isActive = stage === s.id && hasData
+            const runStatus = activeRun?.status
+            const doneIdx = PIPELINE_ORDER.indexOf(activeRun?.stage ?? 'detect')
+            const thisIdx = PIPELINE_ORDER.indexOf(s.id)
+            const passed =
+              Boolean(activeRun) && (runStatus === 'complete' || (running && thisIdx < doneIdx))
             return (
               <button
                 key={s.id}
                 type="button"
-                className={`stage-tab${stage === s.id && hasData ? ' is-active' : ''}${locked ? ' is-locked' : ''}`}
+                className={`stage-tab${isActive ? ' is-active' : ''}${locked ? ' is-locked' : ''}${passed && !isActive ? ' is-done' : ''}`}
                 onClick={() => {
-                  if (!locked) setStage(s.id)
+                  if (!locked && !running) setStage(s.id)
                 }}
-                disabled={locked}
-                aria-current={stage === s.id && hasData ? 'step' : undefined}
-                title={locked ? 'Upload data to unlock this stage' : undefined}
+                disabled={locked || running}
+                aria-current={isActive ? 'step' : undefined}
               >
                 <span className="stage-index">{s.index}</span>
                 <span className="stage-label">{s.label}</span>
@@ -570,14 +875,31 @@ export default function App() {
           })}
         </nav>
 
-        <main className="workspace" key={hasData ? stage : 'empty'}>
-          {!hasData && <EmptyWorkspace />}
-          {hasData && stage === 'detect' && <StageDetect files={files} />}
-          {hasData && stage === 'clean' && <StageClean />}
-          {hasData && stage === 'automl' && <StageAutoml />}
-          {hasData && stage === 'explain' && <StageExplain />}
+        <main className="workspace" key={`${activeRun?.id ?? 'none'}-${hasData ? stage : 'empty'}`}>
+          {!hasData ? (
+            <section className="empty-workspace">
+              <p className="kicker">Pipeline locked</p>
+              <h2 className="block-title">
+                {loggedIn ? 'Upload data, then press Run.' : 'Sign in, then upload data to run.'}
+              </h2>
+              <p className="note">
+                Free-tier limits: {formatStorage(QUOTAS.maxStorageBytes)} storage,{' '}
+                {QUOTAS.maxFiles} files, {QUOTAS.maxRunsPerDay} runs/day.
+              </p>
+            </section>
+          ) : null}
+          {hasData && stage === 'detect' && <StageDetect files={files} run={activeRun} />}
+          {hasData && stage === 'clean' && <StageClean run={activeRun} />}
+          {hasData && stage === 'automl' && <StageAutoml run={activeRun} />}
+          {hasData && stage === 'explain' && <StageExplain run={activeRun} />}
         </main>
+
+        {loggedIn ? (
+          <RunsHistory runs={runs} activeId={activeRun?.id} onSelect={selectRun} />
+        ) : null}
       </div>
+
+      <AuthModal open={authOpen} onClose={() => setAuthOpen(false)} onAuthed={onAuthed} />
     </div>
   )
 }
