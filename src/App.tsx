@@ -10,6 +10,7 @@ import {
 import { AuthModal } from './AuthModal'
 import {
   cloudReady,
+  deleteOwnAccount,
   getProfileStorage,
   logout as logoutCloud,
   restoreSession,
@@ -349,7 +350,7 @@ function FileSections({
           Cloud library · {files.length} file{files.length === 1 ? '' : 's'}
         </p>
         <button type="button" className="text-btn" onClick={onClear}>
-          Clear all
+          Delete all
         </button>
       </div>
       <div className="section-grid">
@@ -376,10 +377,10 @@ function FileSections({
                     <button
                       type="button"
                       className="text-btn"
-                      aria-label={`Remove ${f.name}`}
+                      aria-label={`Delete ${f.name}`}
                       onClick={() => onRemove(f.id)}
                     >
-                      Remove
+                      Delete
                     </button>
                   </li>
                 ))}
@@ -588,13 +589,16 @@ export default function App() {
     [session],
   )
 
-  const removeFile = useCallback((id: string) => {
-    setFiles((prev) => {
-      const next = prev.filter((f) => f.id !== id)
-      if (next.length === 0) setStage('detect')
-      return next
-    })
-  }, [])
+  const removeFile = useCallback(
+    (id: string) => {
+      setFiles((prev) => {
+        const next = prev.filter((f) => f.id !== id)
+        if (next.length === 0) setStage('detect')
+        return next
+      })
+    },
+    [],
+  )
 
   const clearFiles = useCallback(() => {
     setFiles([])
@@ -767,14 +771,37 @@ export default function App() {
               <button type="button" className="text-btn" onClick={logout}>
                 Sign out
               </button>
+              <button
+                type="button"
+                className="text-btn text-btn-danger"
+                onClick={() => {
+                  void (async () => {
+                    const ok = window.confirm(
+                      'Delete your account and all saved files/runs permanently?',
+                    )
+                    if (!ok || !session) return
+                    try {
+                      await deleteOwnAccount()
+                      setSession(null)
+                      setFiles([])
+                      setRuns([])
+                      setActiveRun(null)
+                      setUsage(null)
+                      setMeter(null)
+                      setStage('detect')
+                    } catch (err) {
+                      setRejectNote(
+                        err instanceof Error ? err.message : 'Could not delete account.',
+                      )
+                    }
+                  })()
+                }}
+              >
+                Delete account
+              </button>
             </>
           ) : (
-            <button
-              type="button"
-              className="btn-ghost-inline"
-              onClick={() => setAuthOpen(true)}
-              disabled={!configured}
-            >
+            <button type="button" className="btn-ghost-inline" onClick={() => setAuthOpen(true)}>
               Sign in
             </button>
           )}
@@ -899,7 +926,12 @@ export default function App() {
         ) : null}
       </div>
 
-      <AuthModal open={authOpen} onClose={() => setAuthOpen(false)} onAuthed={onAuthed} />
+      <AuthModal
+        open={authOpen}
+        onClose={() => setAuthOpen(false)}
+        onAuthed={onAuthed}
+        initialMode="register"
+      />
     </div>
   )
 }

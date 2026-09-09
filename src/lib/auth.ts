@@ -156,6 +156,39 @@ export async function logout(): Promise<void> {
   if (error) throw new Error(error.message)
 }
 
+/** Deletes cloud files/runs/profile and the auth user. */
+export async function deleteOwnAccount(): Promise<void> {
+  const supabase = getSupabase()
+  const { data: userData, error: userError } = await supabase.auth.getUser()
+  if (userError) throw new Error(userError.message)
+  const userId = userData.user?.id
+  if (!userId) throw new Error('Not signed in.')
+
+  const { data: docs } = await supabase
+    .from('documents')
+    .select('storage_path')
+    .eq('user_id', userId)
+  const paths = (docs ?? []).map((d) => d.storage_path as string)
+  if (paths.length) {
+    await supabase.storage.from('documents').remove(paths)
+  }
+
+  await supabase.from('documents').delete().eq('user_id', userId)
+  await supabase.from('runs').delete().eq('user_id', userId)
+
+  const { error: rpcError } = await supabase.rpc('delete_own_account')
+  if (rpcError) {
+    // Fallback: remove profile row; auth user may remain if RPC missing
+    await supabase.from('profiles').delete().eq('id', userId)
+    await supabase.auth.signOut()
+    throw new Error(
+      `${rpcError.message} — run supabase/delete_account.sql in the SQL editor, then try again.`,
+    )
+  }
+
+  await supabase.auth.signOut()
+}
+
 export async function getProfileStorage(userId: string): Promise<number> {
   const { data, error } = await getSupabase()
     .from('profiles')

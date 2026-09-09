@@ -278,12 +278,28 @@ strong {
 }
 
 .modal {
+  position: relative;
   width: min(100%, 26rem);
   padding: 1.5rem;
   border: 1px solid var(--line-strong);
   background:
     radial-gradient(ellipse 80% 60% at 100% 0%, rgba(255, 255, 255, 0.06), transparent 55%),
     #0a0a0a;
+}
+
+.modal-close {
+  position: absolute;
+  top: 0.75rem;
+  right: 0.85rem;
+  width: 2rem;
+  height: 2rem;
+  font-size: 1.4rem;
+  line-height: 1;
+  color: var(--fg-muted);
+}
+
+.modal-close:hover {
+  color: var(--fg);
 }
 
 .auth-form {
@@ -635,6 +651,37 @@ strong {
 
 .text-btn:hover {
   color: var(--fg);
+}
+
+.text-btn-danger {
+  color: #c9a3a3;
+}
+
+.text-btn-danger:hover {
+  color: #ffb4b4;
+}
+
+.auth-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  margin: 0 0 1rem;
+  border: 1px solid var(--line);
+}
+
+.auth-tab {
+  min-height: 2.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+
+.auth-tab.is-active {
+  color: var(--fg);
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: inset 0 -2px 0 var(--fg);
 }
 
 .section-grid {
