@@ -740,12 +740,36 @@ strong {
 
 .file-list li {
   display: grid;
-  grid-template-columns: 3.25rem minmax(0, 1fr) auto auto;
-  gap: 0.75rem 1rem;
+  grid-template-columns: 3.25rem minmax(0, 1fr) auto auto auto;
+  gap: 0.75rem 0.85rem;
   align-items: center;
   padding: 0.65rem 0;
   border-bottom: 1px solid var(--line);
   font-size: 0.9rem;
+}
+
+.library-panel {
+  border-top: 1px solid var(--line);
+  padding-top: 1rem;
+}
+
+.library-list li {
+  grid-template-columns: 3.25rem minmax(0, 1fr) auto auto auto auto;
+}
+
+.file-kind-tag {
+  display: inline-block;
+  margin-left: 0.55rem;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+
+.run-files-panel {
+  border-top: 1px solid var(--line);
+  padding-top: 0.75rem;
 }
 
 .file-ext {
@@ -1027,12 +1051,25 @@ strong {
   max-width: 42rem;
 }
 
-.prose p {
-  margin: 0;
-  font-size: 1.02rem;
-  font-weight: 300;
-  color: var(--fg-muted);
-  line-height: 1.65;
+.chart-wrap {
+  margin-top: 0.5rem;
+  border-top: 1px solid var(--line);
+  padding-top: 1rem;
+}
+
+.regression-chart {
+  width: 100%;
+  height: auto;
+  max-width: 640px;
+}
+
+.chart-legend {
+  margin: 0.65rem 0 0;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
 }
 
 .plain-list {
@@ -1182,4 +1219,40 @@ strong {
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+.chart-wrap {
+  margin-top: 0.5rem;
+  border-top: 1px solid var(--line);
+  padding-top: 1rem;
+}
+
+.regression-chart {
+  width: 100%;
+  height: auto;
+  max-width: 640px;
+}
+
+.chart-legend {
+  margin: 0.65rem 0 0;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+
+.prose {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  max-width: 42rem;
+}
+
+.prose p {
+  margin: 0;
+  font-size: 1.02rem;
+  font-weight: 300;
+  color: var(--fg-muted);
+  line-height: 1.65;
 }

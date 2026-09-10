@@ -2,12 +2,14 @@ import {
   useCallback,
   useEffect,
   useId,
+  useMemo,
   useRef,
   useState,
   type ChangeEvent,
   type DragEvent,
 } from 'react'
 import { AuthModal } from './AuthModal'
+import { RegressionChart } from './components/RegressionChart'
 import {
   cloudReady,
   deleteOwnAccount,
@@ -18,9 +20,13 @@ import {
 } from './lib/auth'
 import {
   clearUploads,
+  deleteUpload,
+  downloadUploadedFile,
   loadUploads,
+  snapshotFiles,
   syncUploads,
   validateIncoming,
+  type RunFileSnapshot,
 } from './lib/fileStore'
 import {
   ACCEPT_ATTR,
@@ -49,6 +55,7 @@ import {
   type RunRecord,
   type StageId,
 } from './lib/runs'
+import { runTabularPipeline, type TabularPipelineResult } from './lib/tabular/pipeline'
 
 const STAGES: { id: StageId; index: string; label: string }[] = [
   { id: 'detect', index: '01', label: 'Detect' },
@@ -69,6 +76,46 @@ const DEMO_COLUMNS = [
   { name: 'region', type: 'categorical', missing: '0.8%', note: '8 levels' },
   { name: 'churned', type: 'boolean', missing: '0%', note: 'Target' },
 ]
+
+type DetectResult = {
+  task?: string
+  target?: string
+  predictors?: string[]
+  rows?: number
+  source?: string
+  columns?: { name: string; type: string; missing: string; note: string }[]
+}
+
+type CleanResult = {
+  features?: number
+  trainRows?: number
+  rowsIn?: number
+  missingImputed?: number
+  outliersClipped?: number
+  steps?: string[]
+}
+
+type AutomlResult = {
+  bestModel?: string
+  auc?: number
+  f1?: number
+  r2?: number
+  mae?: number
+  rmse?: number
+  intercept?: number
+  coefficients?: { name: string; value: number }[]
+  equation?: string
+}
+
+type ExplainResult = {
+  narrative?: string
+  chart?: {
+    xLabel: string
+    yLabel: string
+    points: { x: number; y: number; yHat: number }[]
+    line?: { x0: number; y0: number; x1: number; y1: number }
+  }
+}
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -195,17 +242,18 @@ function RunsHistory({
 function StageDetect({ files, run }: { files: UploadedFile[]; run: RunRecord | null }) {
   const counts = countByKind(files)
   const primary = files.find((f) => f.kind === 'numerical') ?? files[0]
-  const detect = (run?.result?.detect as { task?: string; target?: string } | undefined) ?? {
+  const detect = (run?.result?.detect as DetectResult | undefined) ?? {
     task: 'Binary classification',
     target: 'churned',
   }
+  const columns = detect.columns?.length ? detect.columns : DEMO_COLUMNS
 
   return (
     <div className="panel-grid">
       <section className="block">
         <p className="kicker">Library</p>
         <h2 className="block-title">
-          {files.length === 1 ? primary?.name : `${files.length} files sorted`}
+          {detect.source ?? (files.length === 1 ? primary?.name : `${files.length} files sorted`)}
         </h2>
         <dl className="meta-list">
           {FILE_SECTIONS.map((section) => (
@@ -214,6 +262,12 @@ function StageDetect({ files, run }: { files: UploadedFile[]; run: RunRecord | n
               <dd>{counts[section.kind]}</dd>
             </div>
           ))}
+          {detect.rows != null ? (
+            <div>
+              <dt>Rows</dt>
+              <dd>{detect.rows.toLocaleString()}</dd>
+            </div>
+          ) : null}
           <div>
             <dt>Inferred task</dt>
             <dd>{detect.task}</dd>
@@ -240,7 +294,7 @@ function StageDetect({ files, run }: { files: UploadedFile[]; run: RunRecord | n
               </tr>
             </thead>
             <tbody>
-              {DEMO_COLUMNS.map((col) => (
+              {columns.map((col) => (
                 <tr key={col.name}>
                   <td>
                     <code>{col.name}</code>
@@ -259,63 +313,156 @@ function StageDetect({ files, run }: { files: UploadedFile[]; run: RunRecord | n
 }
 
 function StageClean({ run }: { run: RunRecord | null }) {
-  const clean = run?.result?.clean as { features?: number; trainRows?: number } | undefined
+  const clean = run?.result?.clean as CleanResult | undefined
+  const isReal = Boolean(clean?.steps?.length)
   return (
     <div className="panel-grid">
       <section className="block">
         <p className="kicker">Transforms</p>
         <h2 className="block-title">Applied pipeline</h2>
-        <p className="note">Dummy cleaning for run {run?.id ?? '—'}</p>
+        <p className="note">
+          {isReal
+            ? `Cleaning for run ${run?.id ?? '—'}`
+            : `Dummy cleaning for run ${run?.id ?? '—'}`}
+        </p>
         <dl className="meta-list">
           <div>
             <dt>Features</dt>
             <dd>{clean?.features ?? 22}</dd>
           </div>
           <div>
-            <dt>Train rows</dt>
+            <dt>Rows out</dt>
             <dd>{clean?.trainRows?.toLocaleString() ?? '8,736'}</dd>
           </div>
+          {clean?.rowsIn != null ? (
+            <div>
+              <dt>Rows in</dt>
+              <dd>{clean.rowsIn.toLocaleString()}</dd>
+            </div>
+          ) : null}
+          {clean?.missingImputed != null ? (
+            <div>
+              <dt>Imputed</dt>
+              <dd>{clean.missingImputed}</dd>
+            </div>
+          ) : null}
+          {clean?.outliersClipped != null ? (
+            <div>
+              <dt>Outliers clipped</dt>
+              <dd>{clean.outliersClipped}</dd>
+            </div>
+          ) : null}
         </dl>
       </section>
       <section className="block">
-        <p className="kicker">Output</p>
-        <h2 className="block-title">Feature matrix</h2>
-        <p className="note">Impute · encode · scale · stratified split (dummy).</p>
+        <p className="kicker">Steps</p>
+        <h2 className="block-title">{isReal ? 'Cleaning log' : 'Feature matrix'}</h2>
+        {isReal ? (
+          <ul className="plain-list">
+            {clean!.steps!.map((step) => (
+              <li key={step}>{step}</li>
+            ))}
+          </ul>
+        ) : (
+          <p className="note">Impute · encode · scale · stratified split (dummy).</p>
+        )}
       </section>
     </div>
   )
 }
 
 function StageAutoml({ run }: { run: RunRecord | null }) {
-  const automl = run?.result?.automl as
-    | { bestModel?: string; auc?: number; f1?: number }
-    | undefined
+  const automl = run?.result?.automl as AutomlResult | undefined
+  const isLinear = Boolean(automl?.equation || automl?.r2 != null)
   return (
     <div className="panel-stack">
       <section className="block">
-        <p className="kicker">Model search</p>
+        <p className="kicker">Model</p>
         <h2 className="block-title">{automl?.bestModel ?? 'Gradient Boosting'}</h2>
         <dl className="meta-list">
-          <div>
-            <dt>AUC</dt>
-            <dd>
-              <code>{(automl?.auc ?? 0.912).toFixed(3)}</code>
-            </dd>
-          </div>
-          <div>
-            <dt>F1</dt>
-            <dd>
-              <code>{(automl?.f1 ?? 0.84).toFixed(2)}</code>
-            </dd>
-          </div>
+          {isLinear ? (
+            <>
+              <div>
+                <dt>R²</dt>
+                <dd>
+                  <code>{(automl?.r2 ?? 0).toFixed(3)}</code>
+                </dd>
+              </div>
+              <div>
+                <dt>MAE</dt>
+                <dd>
+                  <code>{(automl?.mae ?? 0).toFixed(3)}</code>
+                </dd>
+              </div>
+              <div>
+                <dt>RMSE</dt>
+                <dd>
+                  <code>{(automl?.rmse ?? 0).toFixed(3)}</code>
+                </dd>
+              </div>
+              <div>
+                <dt>Intercept</dt>
+                <dd>
+                  <code>{(automl?.intercept ?? 0).toFixed(3)}</code>
+                </dd>
+              </div>
+            </>
+          ) : (
+            <>
+              <div>
+                <dt>AUC</dt>
+                <dd>
+                  <code>{(automl?.auc ?? 0.912).toFixed(3)}</code>
+                </dd>
+              </div>
+              <div>
+                <dt>F1</dt>
+                <dd>
+                  <code>{(automl?.f1 ?? 0.84).toFixed(2)}</code>
+                </dd>
+              </div>
+            </>
+          )}
         </dl>
+        {automl?.equation ? (
+          <p className="note">
+            <code>{automl.equation}</code>
+          </p>
+        ) : null}
       </section>
+      {automl?.coefficients?.length ? (
+        <section className="block">
+          <p className="kicker">Coefficients</p>
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Variable</th>
+                  <th>β</th>
+                </tr>
+              </thead>
+              <tbody>
+                {automl.coefficients.map((c) => (
+                  <tr key={c.name}>
+                    <td>
+                      <code>{c.name}</code>
+                    </td>
+                    <td>
+                      <code>{c.value.toFixed(4)}</code>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
     </div>
   )
 }
 
 function StageExplain({ run }: { run: RunRecord | null }) {
-  const explain = run?.result?.explain as { narrative?: string } | undefined
+  const explain = run?.result?.explain as ExplainResult | undefined
   return (
     <div className="panel-stack">
       <section className="block">
@@ -329,29 +476,55 @@ function StageExplain({ run }: { run: RunRecord | null }) {
           <p className="muted">Run {run?.id ?? '—'}</p>
         </div>
       </section>
+      {explain?.chart?.points?.length ? (
+        <section className="block">
+          <p className="kicker">Fit</p>
+          <h2 className="block-title">Regression graph</h2>
+          <RegressionChart
+            xLabel={explain.chart.xLabel}
+            yLabel={explain.chart.yLabel}
+            points={explain.chart.points}
+            line={explain.chart.line}
+          />
+        </section>
+      ) : null}
     </div>
   )
 }
 
 function FileSections({
   files,
+  title,
+  emptyLabel,
+  removeLabel,
   onRemove,
   onClear,
+  onDownload,
+  clearLabel,
+  showDownload = true,
 }: {
   files: UploadedFile[]
+  title: string
+  emptyLabel: string
+  removeLabel: string
   onRemove: (id: string) => void
-  onClear: () => void
+  onClear?: () => void
+  onDownload?: (file: UploadedFile) => void
+  clearLabel?: string
+  showDownload?: boolean
 }) {
   const sections = groupByKind(files)
   return (
     <div className="file-sections">
       <div className="file-list-head">
         <p className="kicker">
-          Cloud library · {files.length} file{files.length === 1 ? '' : 's'}
+          {title} · {files.length}
         </p>
-        <button type="button" className="text-btn" onClick={onClear}>
-          Delete all
-        </button>
+        {onClear ? (
+          <button type="button" className="text-btn" onClick={onClear}>
+            {clearLabel ?? 'Clear'}
+          </button>
+        ) : null}
       </div>
       <div className="section-grid">
         {sections.map((section) => (
@@ -364,7 +537,7 @@ function FileSections({
               <span className="file-section-count">{section.files.length}</span>
             </header>
             {section.files.length === 0 ? (
-              <p className="file-section-empty">No files yet</p>
+              <p className="file-section-empty">{emptyLabel}</p>
             ) : (
               <ul className="file-list">
                 {section.files.map((f) => (
@@ -374,13 +547,25 @@ function FileSections({
                       {f.name}
                     </span>
                     <span className="file-size">{formatBytes(f.size)}</span>
+                    {showDownload && onDownload ? (
+                      <button
+                        type="button"
+                        className="text-btn"
+                        aria-label={`Download ${f.name}`}
+                        onClick={() => onDownload(f)}
+                      >
+                        Download
+                      </button>
+                    ) : (
+                      <span />
+                    )}
                     <button
                       type="button"
-                      className="text-btn"
-                      aria-label={`Delete ${f.name}`}
+                      className="text-btn text-btn-danger"
+                      aria-label={`${removeLabel} ${f.name}`}
                       onClick={() => onRemove(f.id)}
                     >
-                      Delete
+                      {removeLabel}
                     </button>
                   </li>
                 ))}
@@ -393,17 +578,144 @@ function FileSections({
   )
 }
 
-function UploadZone({
+function LibraryPanel({
   files,
-  onAdd,
-  onRemove,
-  onClear,
-  rejectNote,
+  stagedIds,
+  onDownload,
+  onDelete,
+  onDeleteAll,
+  onAddToRun,
 }: {
   files: UploadedFile[]
+  stagedIds: Set<string>
+  onDownload: (file: UploadedFile) => void
+  onDelete: (id: string) => void
+  onDeleteAll: () => void
+  onAddToRun: (id: string) => void
+}) {
+  return (
+    <section className="library-panel">
+      <div className="file-list-head">
+        <p className="kicker">
+          All saved files · {files.length} (database)
+        </p>
+        {files.length > 0 ? (
+          <button type="button" className="text-btn text-btn-danger" onClick={onDeleteAll}>
+            Delete all from DB
+          </button>
+        ) : null}
+      </div>
+      <p className="note note-tight">
+        Permanent library. Delete here removes the file from Supabase. Removing from a run section
+        above only unstages it for the next run.
+      </p>
+      {files.length === 0 ? (
+        <p className="file-section-empty">No files saved yet.</p>
+      ) : (
+        <ul className="file-list library-list">
+          {files.map((f) => {
+            const staged = stagedIds.has(f.id)
+            return (
+              <li key={f.id}>
+                <span className="file-ext">{f.ext}</span>
+                <span className="file-name" title={f.name}>
+                  {f.name}
+                  <span className="file-kind-tag">{f.kind}</span>
+                </span>
+                <span className="file-size">{formatBytes(f.size)}</span>
+                {staged ? (
+                  <span className="muted">in next run</span>
+                ) : (
+                  <button type="button" className="text-btn" onClick={() => onAddToRun(f.id)}>
+                    Add to run
+                  </button>
+                )}
+                <button type="button" className="text-btn" onClick={() => onDownload(f)}>
+                  Download
+                </button>
+                <button
+                  type="button"
+                  className="text-btn text-btn-danger"
+                  onClick={() => onDelete(f.id)}
+                >
+                  Delete from DB
+                </button>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </section>
+  )
+}
+
+function RunFilesPanel({
+  runId,
+  files,
+  library,
+  onDownload,
+}: {
+  runId: string
+  files: RunFileSnapshot[]
+  library: UploadedFile[]
+  onDownload: (file: UploadedFile) => void
+}) {
+  if (!files.length) {
+    return (
+      <section className="run-files-panel">
+        <p className="kicker">Run files</p>
+        <p className="note">No file snapshot stored for {runId}.</p>
+      </section>
+    )
+  }
+
+  return (
+    <section className="run-files-panel">
+      <div className="file-list-head">
+        <p className="kicker">
+          Files used in {runId} · {files.length}
+        </p>
+      </div>
+      <ul className="file-list">
+        {files.map((snap) => {
+          const local = library.find((f) => f.id === snap.id)
+          return (
+            <li key={snap.id}>
+              <span className="file-ext">{snap.ext}</span>
+              <span className="file-name" title={snap.name}>
+                {snap.name}
+              </span>
+              <span className="file-size">{formatBytes(snap.size)}</span>
+              {local ? (
+                <button
+                  type="button"
+                  className="text-btn"
+                  onClick={() => onDownload(local)}
+                >
+                  Download
+                </button>
+              ) : (
+                <span className="muted">removed from library</span>
+              )}
+            </li>
+          )
+        })}
+      </ul>
+    </section>
+  )
+}
+
+function UploadZone({
+  stagedFiles,
+  onAdd,
+  onUnstage,
+  onClearStage,
+  rejectNote,
+}: {
+  stagedFiles: UploadedFile[]
   onAdd: (files: File[]) => void
-  onRemove: (id: string) => void
-  onClear: () => void
+  onUnstage: (id: string) => void
+  onClearStage: () => void
   rejectNote: string | null
 }) {
   const inputId = useId()
@@ -448,14 +760,13 @@ function UploadZone({
           ↑
         </span>
         <div className="upload-copy">
-          <strong>{files.length ? 'Add more files' : 'Drop files here'}</strong>
+          <strong>{stagedFiles.length ? 'Add more to next run' : 'Drop files for next run'}</strong>
           <span className="muted">
             or{' '}
             <label htmlFor={inputId} className="upload-browse">
               browse
             </label>{' '}
-            — encrypted to Supabase · max {Math.round(QUOTAS.maxFileBytes / (1024 * 1024))} MB /
-            file
+            — uploads save to your library; sections below are only for this run
           </span>
         </div>
         <button
@@ -467,9 +778,16 @@ function UploadZone({
         </button>
       </div>
       {rejectNote ? <p className="upload-warn">{rejectNote}</p> : null}
-      {files.length > 0 ? (
-        <FileSections files={files} onRemove={onRemove} onClear={onClear} />
-      ) : null}
+      <FileSections
+        files={stagedFiles}
+        title="Next run"
+        emptyLabel="Nothing staged for the next run"
+        removeLabel="Remove from run"
+        clearLabel="Clear run selection"
+        showDownload={false}
+        onRemove={onUnstage}
+        onClear={onClearStage}
+      />
     </div>
   )
 }
@@ -478,7 +796,8 @@ export default function App() {
   const configured = cloudReady()
   const [session, setSession] = useState<AuthSession | null>(null)
   const [authOpen, setAuthOpen] = useState(false)
-  const [files, setFiles] = useState<UploadedFile[]>([])
+  const [files, setFiles] = useState<UploadedFile[]>([]) // permanent library
+  const [stagedIds, setStagedIds] = useState<string[]>([])
   const [stage, setStage] = useState<StageId>('detect')
   const [ready, setReady] = useState(false)
   const [activeRun, setActiveRun] = useState<RunRecord | null>(null)
@@ -488,11 +807,27 @@ export default function App() {
   const [meter, setMeter] = useState<ResourceMeter | null>(null)
   const [rejectNote, setRejectNote] = useState<string | null>(null)
   const [syncError, setSyncError] = useState<string | null>(null)
+  const [libraryHydrated, setLibraryHydrated] = useState(false)
   const runToken = useRef(0)
   const pendingRun = useRef(false)
 
-  const hasData = files.length > 0
+  const stagedIdSet = useMemo(() => new Set(stagedIds), [stagedIds])
+  const stagedFiles = useMemo(
+    () => files.filter((f) => stagedIdSet.has(f.id)),
+    [files, stagedIdSet],
+  )
+  const hasData = stagedFiles.length > 0
   const loggedIn = Boolean(session)
+  const activeRunFiles = (activeRun?.result?.files as RunFileSnapshot[] | undefined) ?? []
+  const canBrowsePipeline =
+    hasData ||
+    Boolean(
+      activeRun &&
+        (activeRun.result.detect ||
+          activeRun.result.clean ||
+          activeRun.result.automl ||
+          activeRun.result.explain),
+    )
 
   const refreshUsage = useCallback(async (userId: string, fileList: UploadedFile[]) => {
     const [storageUsed, runsToday] = await Promise.all([
@@ -510,27 +845,36 @@ export default function App() {
 
   const hydrateUser = useCallback(
     async (next: AuthSession, memoryFiles: UploadedFile[] = []) => {
-      const stored = await loadUploads(next.user.id, next.dataKey)
-      const mergedMap = new Map<string, UploadedFile>()
-      for (const f of stored) mergedMap.set(f.id, f)
-      for (const f of memoryFiles) if (!mergedMap.has(f.id)) mergedMap.set(f.id, f)
-      const merged = [...mergedMap.values()]
-      const history = await listRuns(next.user.id)
-      const latest = history[0] ?? (await getLatestRun(next.user.id))
-      setFiles(merged)
-      setRuns(history)
-      setActiveRun(latest)
-      if (latest) setStage(latest.stage)
-      if (latest?.resources) {
-        setMeter({
-          memoryMb: latest.resources.peakMemoryMb,
-          memoryLimitMb: QUOTAS.maxMemoryMb,
-          computeUnits: latest.resources.computeUnits,
-          computeLimit: latest.resources.computeLimit,
-          stageLabel: latest.stage,
-        })
+      setLibraryHydrated(false)
+      try {
+        const stored = await loadUploads(next.user.id, next.dataKey)
+        const mergedMap = new Map<string, UploadedFile>()
+        for (const f of stored) mergedMap.set(f.id, f)
+        for (const f of memoryFiles) if (!mergedMap.has(f.id)) mergedMap.set(f.id, f)
+        const merged = [...mergedMap.values()]
+        const history = await listRuns(next.user.id)
+        const latest = history[0] ?? (await getLatestRun(next.user.id))
+        setFiles(merged)
+        setStagedIds(merged.map((f) => f.id))
+        setRuns(history)
+        setActiveRun(latest)
+        if (latest) setStage(latest.status === 'complete' ? 'explain' : latest.stage)
+        if (latest?.resources) {
+          setMeter({
+            memoryMb: latest.resources.peakMemoryMb,
+            memoryLimitMb: QUOTAS.maxMemoryMb,
+            computeUnits: latest.resources.computeUnits,
+            computeLimit: latest.resources.computeLimit,
+            stageLabel: latest.stage,
+          })
+        }
+        await refreshUsage(next.user.id, merged)
+        if (memoryFiles.length) {
+          await syncUploads(next.user.id, next.dataKey, merged)
+        }
+      } finally {
+        setLibraryHydrated(true)
       }
-      await refreshUsage(next.user.id, merged)
     },
     [refreshUsage],
   )
@@ -549,8 +893,12 @@ export default function App() {
         await hydrateUser(restored)
       }
       if (!cancelled) setReady(true)
-    })().catch(() => {
-      if (!cancelled) setReady(true)
+    })().catch((err) => {
+      if (!cancelled) {
+        setSyncError(err instanceof Error ? err.message : 'Failed to restore session')
+        setReady(true)
+        setLibraryHydrated(true)
+      }
     })
     return () => {
       cancelled = true
@@ -558,7 +906,7 @@ export default function App() {
   }, [configured, hydrateUser])
 
   useEffect(() => {
-    if (!ready || !session) return
+    if (!ready || !session || !libraryHydrated) return
     const handle = window.setTimeout(() => {
       void syncUploads(session.user.id, session.dataKey, files)
         .then(() => {
@@ -568,9 +916,9 @@ export default function App() {
         .catch((err) => {
           setSyncError(err instanceof Error ? err.message : 'Sync failed')
         })
-    }, 600)
+    }, 700)
     return () => window.clearTimeout(handle)
-  }, [files, ready, session, refreshUsage])
+  }, [files, ready, session, libraryHydrated, refreshUsage])
 
   const addFiles = useCallback(
     (incoming: File[]) => {
@@ -583,28 +931,69 @@ export default function App() {
         const { accepted, error } = validateIncoming(prev, incoming)
         setRejectNote(error)
         if (!accepted.length) return prev
+        setStagedIds((ids) => {
+          const next = new Set(ids)
+          for (const f of accepted) next.add(f.id)
+          return [...next]
+        })
         return [...prev, ...accepted]
       })
     },
     [session],
   )
 
-  const removeFile = useCallback(
+  const unstageFile = useCallback((id: string) => {
+    setStagedIds((ids) => ids.filter((x) => x !== id))
+  }, [])
+
+  const clearStage = useCallback(() => {
+    setStagedIds([])
+  }, [])
+
+  const addToRun = useCallback((id: string) => {
+    setStagedIds((ids) => (ids.includes(id) ? ids : [...ids, id]))
+  }, [])
+
+  const deleteFromLibrary = useCallback(
     (id: string) => {
-      setFiles((prev) => {
-        const next = prev.filter((f) => f.id !== id)
-        if (next.length === 0) setStage('detect')
-        return next
-      })
+      const ok = window.confirm('Delete this file permanently from your saved library?')
+      if (!ok) return
+      setFiles((prev) => prev.filter((f) => f.id !== id))
+      setStagedIds((ids) => ids.filter((x) => x !== id))
+      if (session) {
+        void deleteUpload(session.user.id, id)
+          .then(() =>
+            refreshUsage(
+              session.user.id,
+              files.filter((f) => f.id !== id),
+            ),
+          )
+          .catch((err) => {
+            setSyncError(err instanceof Error ? err.message : 'Delete failed')
+          })
+      }
     },
-    [],
+    [session, files, refreshUsage],
   )
 
-  const clearFiles = useCallback(() => {
+  const deleteAllFromLibrary = useCallback(() => {
+    const ok = window.confirm('Delete ALL saved files from the database?')
+    if (!ok) return
     setFiles([])
+    setStagedIds([])
     setStage('detect')
-    if (session) void clearUploads(session.user.id).then(() => refreshUsage(session.user.id, []))
+    if (session) {
+      void clearUploads(session.user.id)
+        .then(() => refreshUsage(session.user.id, []))
+        .catch((err) => {
+          setSyncError(err instanceof Error ? err.message : 'Clear failed')
+        })
+    }
   }, [session, refreshUsage])
+
+  const onDownload = useCallback((file: UploadedFile) => {
+    downloadUploadedFile(file)
+  }, [])
 
   const onAuthed = useCallback(
     async (next: AuthSession) => {
@@ -617,9 +1006,11 @@ export default function App() {
   const logout = useCallback(async () => {
     runToken.current += 1
     setRunning(false)
+    setLibraryHydrated(false)
     await logoutCloud().catch(() => {})
     setSession(null)
     setFiles([])
+    setStagedIds([])
     setRuns([])
     setActiveRun(null)
     setUsage(null)
@@ -634,7 +1025,7 @@ export default function App() {
       setAuthOpen(true)
       return
     }
-    if (!files.length || running) return
+    if (!stagedFiles.length || running) return
 
     const runsToday = await countRunsToday(session.user.id)
     if (runsToday >= QUOTAS.maxRunsPerDay) {
@@ -645,20 +1036,37 @@ export default function App() {
 
     pendingRun.current = false
     const token = ++runToken.current
-    const totalBytes = files.reduce((s, f) => s + f.size, 0)
-    const estimate = estimateRunResources(totalBytes, files.length)
+    const runFiles = stagedFiles
+    const totalBytes = runFiles.reduce((s, f) => s + f.size, 0)
+    const estimate = estimateRunResources(totalBytes, runFiles.length)
     const now = Date.now()
     let compute = 0
+
+    let tabular: TabularPipelineResult | null = null
+    try {
+      tabular = await runTabularPipeline(runFiles)
+    } catch (err) {
+      setRejectNote(
+        err instanceof Error
+          ? `Tabular pipeline failed (${err.message}). Falling back to demo results.`
+          : 'Tabular pipeline failed. Falling back to demo results.',
+      )
+      tabular = null
+    }
+
+    const fileSnap = snapshotFiles(runFiles)
     const run: RunRecord = {
       id: createRunId(),
       userId: session.user.id,
       status: 'running',
       stage: 'detect',
-      fileCount: files.length,
+      fileCount: runFiles.length,
       createdAt: now,
       updatedAt: now,
-      summary: 'Pipeline started',
-      result: {},
+      summary: tabular
+        ? `Linear regression on ${tabular.fileName}`
+        : 'Dummy pipeline started',
+      result: { files: fileSnap },
       resources: {
         peakMemoryMb: estimate.memoryMb,
         computeUnits: 0,
@@ -666,6 +1074,9 @@ export default function App() {
         durationMs: 0,
       },
     }
+
+    // Persist full library (not just staged) before finishing
+    await syncUploads(session.user.id, session.dataKey, files).catch(() => {})
 
     setRunning(true)
     setActiveRun(run)
@@ -678,14 +1089,19 @@ export default function App() {
         estimate.computeLimit,
         compute + Math.round(estimate.computeLimit / PIPELINE_ORDER.length),
       )
+      const stageResult = tabular
+        ? tabular[nextStage]
+        : dummyResultFor(nextStage)
       const updated: RunRecord = {
         ...run,
         stage: nextStage,
         updatedAt: Date.now(),
-        summary: `Dummy ${nextStage} complete`,
+        summary: tabular
+          ? `${tabular.automl.bestModel} · ${nextStage}`
+          : `Dummy ${nextStage} complete`,
         status: nextStage === 'explain' ? 'complete' : 'running',
         completedAt: nextStage === 'explain' ? Date.now() : undefined,
-        result: { ...run.result, [nextStage]: dummyResultFor(nextStage) },
+        result: { ...run.result, files: fileSnap, [nextStage]: stageResult },
         resources: {
           peakMemoryMb: estimate.memoryMb,
           computeUnits: compute,
@@ -704,7 +1120,7 @@ export default function App() {
         stageLabel: nextStage,
       })
       await saveRun(updated)
-      await sleep(nextStage === 'explain' ? 650 : 1000)
+      await sleep(nextStage === 'explain' ? 450 : 700)
     }
 
     if (runToken.current === token) {
@@ -713,18 +1129,18 @@ export default function App() {
       setRuns(history)
       await refreshUsage(session.user.id, files)
     }
-  }, [configured, files, refreshUsage, running, session])
+  }, [configured, files, stagedFiles, refreshUsage, running, session])
 
   useEffect(() => {
-    if (!session || !pendingRun.current || !files.length || running) return
+    if (!session || !pendingRun.current || !stagedFiles.length || running) return
     pendingRun.current = false
     void startRun()
-  }, [session, files.length, running, startRun])
+  }, [session, stagedFiles.length, running, startRun])
 
   const selectRun = (run: RunRecord) => {
     if (running) return
     setActiveRun(run)
-    setStage(run.stage)
+    setStage(run.status === 'complete' ? 'explain' : run.stage)
     setMeter({
       memoryMb: run.resources.peakMemoryMb,
       memoryLimitMb: QUOTAS.maxMemoryMb,
@@ -831,13 +1247,23 @@ export default function App() {
         {syncError ? <p className="upload-warn">Sync: {syncError}</p> : null}
 
         {loggedIn ? (
-          <UploadZone
-            files={files}
-            onAdd={addFiles}
-            onRemove={removeFile}
-            onClear={clearFiles}
-            rejectNote={rejectNote}
-          />
+          <>
+            <UploadZone
+              stagedFiles={stagedFiles}
+              onAdd={addFiles}
+              onUnstage={unstageFile}
+              onClearStage={clearStage}
+              rejectNote={rejectNote}
+            />
+            <LibraryPanel
+              files={files}
+              stagedIds={stagedIdSet}
+              onDownload={onDownload}
+              onDelete={deleteFromLibrary}
+              onDeleteAll={deleteAllFromLibrary}
+              onAddToRun={addToRun}
+            />
+          </>
         ) : (
           <div className="upload-block" aria-hidden="true">
             <div className="upload-zone is-inert">
@@ -851,6 +1277,15 @@ export default function App() {
             </div>
           </div>
         )}
+
+        {loggedIn && activeRun ? (
+          <RunFilesPanel
+            runId={activeRun.id}
+            files={activeRunFiles}
+            library={files}
+            onDownload={onDownload}
+          />
+        ) : null}
 
         <div className="run-bar">
           <div className="run-bar-copy">
@@ -877,8 +1312,8 @@ export default function App() {
 
         <nav className="stage-nav" aria-label="Pipeline stages">
           {STAGES.map((s) => {
-            const locked = !hasData
-            const isActive = stage === s.id && hasData
+            const locked = !canBrowsePipeline
+            const isActive = stage === s.id && canBrowsePipeline
             const runStatus = activeRun?.status
             const doneIdx = PIPELINE_ORDER.indexOf(activeRun?.stage ?? 'detect')
             const thisIdx = PIPELINE_ORDER.indexOf(s.id)
@@ -902,8 +1337,11 @@ export default function App() {
           })}
         </nav>
 
-        <main className="workspace" key={`${activeRun?.id ?? 'none'}-${hasData ? stage : 'empty'}`}>
-          {!hasData ? (
+        <main
+          className="workspace"
+          key={`${activeRun?.id ?? 'none'}-${canBrowsePipeline ? stage : 'empty'}`}
+        >
+          {!canBrowsePipeline ? (
             <section className="empty-workspace">
               <p className="kicker">Pipeline locked</p>
               <h2 className="block-title">
@@ -915,10 +1353,12 @@ export default function App() {
               </p>
             </section>
           ) : null}
-          {hasData && stage === 'detect' && <StageDetect files={files} run={activeRun} />}
-          {hasData && stage === 'clean' && <StageClean run={activeRun} />}
-          {hasData && stage === 'automl' && <StageAutoml run={activeRun} />}
-          {hasData && stage === 'explain' && <StageExplain run={activeRun} />}
+          {canBrowsePipeline && stage === 'detect' && (
+            <StageDetect files={stagedFiles.length ? stagedFiles : files} run={activeRun} />
+          )}
+          {canBrowsePipeline && stage === 'clean' && <StageClean run={activeRun} />}
+          {canBrowsePipeline && stage === 'automl' && <StageAutoml run={activeRun} />}
+          {canBrowsePipeline && stage === 'explain' && <StageExplain run={activeRun} />}
         </main>
 
         {loggedIn ? (
