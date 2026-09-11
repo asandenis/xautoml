@@ -38,11 +38,17 @@ export function cleanTabular(table: ParsedTable): CleanReport {
   let missingImputed = 0
   let outliersClipped = 0
 
-  // Drop rows where dependent (col 0) is missing
+  if (table.nonNumericCells > 0) {
+    steps.push(
+      `Treated ${table.nonNumericCells} non-numeric cell(s) as missing (impute / drop)`,
+    )
+  }
+
+  // Drop rows where dependent (col 0) is missing / non-numeric
   let working = table.rows.filter((row) => !Number.isNaN(row[0]))
   const droppedY = table.rows.length - working.length
   if (droppedY > 0) {
-    steps.push(`Dropped ${droppedY} row(s) with missing dependent value`)
+    steps.push(`Dropped ${droppedY} row(s) with missing/non-numeric dependent value`)
   }
 
   // Median impute predictors (and keep y as-is)

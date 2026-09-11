@@ -13,8 +13,8 @@ import { RegressionChart } from './components/RegressionChart'
 import {
   cloudReady,
   deleteOwnAccount,
-  getProfileStorage,
   logout as logoutCloud,
+  onAuthChange,
   restoreSession,
   type AuthSession,
 } from './lib/auth'
@@ -22,6 +22,7 @@ import {
   clearUploads,
   deleteUpload,
   downloadUploadedFile,
+  getLibraryStats,
   loadUploads,
   snapshotFiles,
   syncUploads,
@@ -48,8 +49,8 @@ import {
 import {
   countRunsToday,
   createRunId,
+  deleteRun,
   dummyResultFor,
-  getLatestRun,
   listRuns,
   saveRun,
   type RunRecord,
@@ -202,10 +203,12 @@ function RunsHistory({
   runs,
   activeId,
   onSelect,
+  onDelete,
 }: {
   runs: RunRecord[]
   activeId?: string
   onSelect: (run: RunRecord) => void
+  onDelete: (run: RunRecord) => void
 }) {
   return (
     <section className="runs-history">
@@ -217,7 +220,7 @@ function RunsHistory({
       ) : (
         <ul className="runs-list">
           {runs.map((run) => (
-            <li key={run.id}>
+            <li key={run.id} className="run-row">
               <button
                 type="button"
                 className={`run-item${activeId === run.id ? ' is-active' : ''}`}
@@ -230,6 +233,17 @@ function RunsHistory({
                 <span className="run-item-date">
                   {new Date(run.createdAt).toLocaleString()}
                 </span>
+              </button>
+              <button
+                type="button"
+                className="run-delete"
+                aria-label={`Delete run ${run.id}`}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onDelete(run)
+                }}
+              >
+                Delete
               </button>
             </li>
           ))}
@@ -830,45 +844,64 @@ export default function App() {
     )
 
   const refreshUsage = useCallback(async (userId: string, fileList: UploadedFile[]) => {
-    const [storageUsed, runsToday] = await Promise.all([
-      getProfileStorage(userId).catch(() => fileList.reduce((s, f) => s + f.size, 0)),
+    const localBytes = fileList.reduce((s, f) => s + f.size, 0)
+    const [libraryStats, runsToday] = await Promise.all([
+      getLibraryStats(userId).catch(() => ({
+        fileCount: fileList.length,
+        storageBytes: localBytes,
+      })),
       countRunsToday(userId).catch(() => 0),
     ])
-    setUsage(
-      buildUsage(
-        Math.max(storageUsed, fileList.reduce((s, f) => s + f.size, 0)),
-        fileList.length,
-        runsToday,
-      ),
-    )
+    // Prefer live library rows; fall back to decrypted in-memory list
+    const storageUsed =
+      libraryStats.fileCount > 0 ? libraryStats.storageBytes : localBytes
+    const fileCount =
+      libraryStats.fileCount > 0 ? libraryStats.fileCount : fileList.length
+    setUsage(buildUsage(storageUsed, fileCount, runsToday))
   }, [])
 
   const hydrateUser = useCallback(
     async (next: AuthSession, memoryFiles: UploadedFile[] = []) => {
       setLibraryHydrated(false)
+      setSyncError(null)
       try {
-        const stored = await loadUploads(next.user.id, next.dataKey)
+        const [history, libraryStats, runsToday, stored] = await Promise.all([
+          listRuns(next.user.id).catch(() => [] as RunRecord[]),
+          getLibraryStats(next.user.id).catch(() => ({ fileCount: 0, storageBytes: 0 })),
+          countRunsToday(next.user.id).catch(() => 0),
+          loadUploads(next.user.id, next.dataKey).catch((err) => {
+            setSyncError(err instanceof Error ? err.message : 'Failed to load saved files')
+            return [] as UploadedFile[]
+          }),
+        ])
+
         const mergedMap = new Map<string, UploadedFile>()
         for (const f of stored) mergedMap.set(f.id, f)
         for (const f of memoryFiles) if (!mergedMap.has(f.id)) mergedMap.set(f.id, f)
         const merged = [...mergedMap.values()]
-        const history = await listRuns(next.user.id)
-        const latest = history[0] ?? (await getLatestRun(next.user.id))
+
         setFiles(merged)
-        setStagedIds(merged.map((f) => f.id))
+        // Stage nothing / open no past run — user picks a run or stages files manually
+        setStagedIds([])
         setRuns(history)
-        setActiveRun(latest)
-        if (latest) setStage(latest.status === 'complete' ? 'explain' : latest.stage)
-        if (latest?.resources) {
-          setMeter({
-            memoryMb: latest.resources.peakMemoryMb,
-            memoryLimitMb: QUOTAS.maxMemoryMb,
-            computeUnits: latest.resources.computeUnits,
-            computeLimit: latest.resources.computeLimit,
-            stageLabel: latest.stage,
-          })
-        }
+        setActiveRun(null)
+        setMeter(null)
+        setStage('detect')
+
+        const localBytes = merged.reduce((s, f) => s + f.size, 0)
+        const storageUsed =
+          libraryStats.fileCount > 0 ? libraryStats.storageBytes : localBytes
+        const fileCount =
+          libraryStats.fileCount > 0 ? libraryStats.fileCount : merged.length
+        setUsage(buildUsage(storageUsed, fileCount, runsToday))
         await refreshUsage(next.user.id, merged)
+
+        if (merged.length !== libraryStats.fileCount && libraryStats.fileCount > 0) {
+          setSyncError(
+            `Loaded ${merged.length}/${libraryStats.fileCount} library file(s). Some could not be decrypted.`,
+          )
+        }
+
         if (memoryFiles.length) {
           await syncUploads(next.user.id, next.dataKey, merged)
         }
@@ -879,31 +912,77 @@ export default function App() {
     [refreshUsage],
   )
 
+  const hydrateUserRef = useRef(hydrateUser)
+  hydrateUserRef.current = hydrateUser
+  const hydratedUserIdRef = useRef<string | null>(null)
+
   useEffect(() => {
     let cancelled = false
-    ;(async () => {
-      if (!configured) {
-        setReady(true)
-        return
+    let chain: Promise<void> = Promise.resolve()
+
+    const applySession = (restored: AuthSession | null, force: boolean) => {
+      chain = chain.then(async () => {
+        if (cancelled) return
+        try {
+          if (restored) {
+            if (!force && hydratedUserIdRef.current === restored.user.id) {
+              if (!cancelled) setReady(true)
+              return
+            }
+            setSession(restored)
+            await hydrateUserRef.current(restored)
+            hydratedUserIdRef.current = restored.user.id
+          } else {
+            hydratedUserIdRef.current = null
+            setSession(null)
+            setFiles([])
+            setStagedIds([])
+            setRuns([])
+            setActiveRun(null)
+            setUsage(null)
+            setMeter(null)
+            setLibraryHydrated(true)
+          }
+        } catch (err) {
+          if (!cancelled) {
+            setSyncError(err instanceof Error ? err.message : 'Failed to restore session')
+            setLibraryHydrated(true)
+          }
+        } finally {
+          if (!cancelled) setReady(true)
+        }
+      })
+      return chain
+    }
+
+    if (!configured) {
+      setReady(true)
+      return () => {
+        cancelled = true
       }
-      const restored = await restoreSession()
+    }
+
+    void restoreSession()
+      .then((restored) => applySession(restored, true))
+      .catch((err) => {
+        if (!cancelled) {
+          setSyncError(err instanceof Error ? err.message : 'Failed to restore session')
+          setReady(true)
+          setLibraryHydrated(true)
+        }
+      })
+
+    const unsub = onAuthChange((next) => {
       if (cancelled) return
-      if (restored) {
-        setSession(restored)
-        await hydrateUser(restored)
-      }
-      if (!cancelled) setReady(true)
-    })().catch((err) => {
-      if (!cancelled) {
-        setSyncError(err instanceof Error ? err.message : 'Failed to restore session')
-        setReady(true)
-        setLibraryHydrated(true)
-      }
+      // restoreSession handles the first paint; only react to real auth changes
+      void applySession(next, false)
     })
+
     return () => {
       cancelled = true
+      unsub()
     }
-  }, [configured, hydrateUser])
+  }, [configured])
 
   useEffect(() => {
     if (!ready || !session || !libraryHydrated) return
@@ -997,6 +1076,7 @@ export default function App() {
 
   const onAuthed = useCallback(
     async (next: AuthSession) => {
+      hydratedUserIdRef.current = next.user.id
       setSession(next)
       await hydrateUser(next, files)
     },
@@ -1007,6 +1087,7 @@ export default function App() {
     runToken.current += 1
     setRunning(false)
     setLibraryHydrated(false)
+    hydratedUserIdRef.current = null
     await logoutCloud().catch(() => {})
     setSession(null)
     setFiles([])
@@ -1149,6 +1230,38 @@ export default function App() {
       stageLabel: run.stage,
     })
   }
+
+  const removeRun = useCallback(
+    async (run: RunRecord) => {
+      if (!session || running) return
+      try {
+        await deleteRun(session.user.id, run.id)
+        const history = await listRuns(session.user.id)
+        setRuns(history)
+        if (activeRun?.id === run.id) {
+          const next = history[0] ?? null
+          setActiveRun(next)
+          if (next) {
+            setStage(next.status === 'complete' ? 'explain' : next.stage)
+            setMeter({
+              memoryMb: next.resources.peakMemoryMb,
+              memoryLimitMb: QUOTAS.maxMemoryMb,
+              computeUnits: next.resources.computeUnits,
+              computeLimit: next.resources.computeLimit,
+              stageLabel: next.stage,
+            })
+          } else {
+            setMeter(null)
+            setStage('detect')
+          }
+        }
+        await refreshUsage(session.user.id, files)
+      } catch (err) {
+        setSyncError(err instanceof Error ? err.message : 'Failed to delete run')
+      }
+    },
+    [session, running, activeRun?.id, files, refreshUsage],
+  )
 
   const statusLabel = !ready
     ? 'Restoring…'
@@ -1362,7 +1475,12 @@ export default function App() {
         </main>
 
         {loggedIn ? (
-          <RunsHistory runs={runs} activeId={activeRun?.id} onSelect={selectRun} />
+          <RunsHistory
+            runs={runs}
+            activeId={activeRun?.id}
+            onSelect={selectRun}
+            onDelete={(run) => void removeRun(run)}
+          />
         ) : null}
       </div>
 

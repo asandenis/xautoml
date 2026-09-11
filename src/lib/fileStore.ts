@@ -1,4 +1,4 @@
-import { decryptBytes, encryptBytes } from './crypto'
+import { bufToB64, decryptBytes, encryptBytes } from './crypto'
 import type { FileKind, UploadedFile } from './files'
 import { fileFingerprint, toUploadedFile } from './files'
 import { setProfileStorage } from './auth'
@@ -23,8 +23,19 @@ function pathFor(userId: string, id: string) {
   return `${userId}/${id}.bin`
 }
 
-async function blobToCiphertextB64(blob: Blob): Promise<string> {
-  return blob.text()
+/** Storage holds raw ciphertext bytes (from b64ToBlob). Also try legacy text-b64. */
+async function decryptStoredBlob(
+  dataKey: CryptoKey,
+  iv: string,
+  blob: Blob,
+): Promise<ArrayBuffer> {
+  const buf = await blob.arrayBuffer()
+  try {
+    return await decryptBytes(dataKey, iv, bufToB64(buf))
+  } catch {
+    const asText = new TextDecoder().decode(buf).trim()
+    return decryptBytes(dataKey, iv, asText)
+  }
 }
 
 function b64ToBlob(b64: string, type = 'application/octet-stream') {
@@ -52,6 +63,23 @@ function rowToUploaded(row: DocumentRow, plain: ArrayBuffer): UploadedFile {
   }
 }
 
+/** Storage/file counts from DB metadata (no decrypt) — for meters on load. */
+export async function getLibraryStats(
+  userId: string,
+): Promise<{ fileCount: number; storageBytes: number }> {
+  const supabase = getSupabase()
+  const { data, error } = await supabase
+    .from('documents')
+    .select('size')
+    .eq('user_id', userId)
+  if (error) throw new Error(error.message)
+  const rows = data ?? []
+  return {
+    fileCount: rows.length,
+    storageBytes: rows.reduce((s, r) => s + Number(r.size ?? 0), 0),
+  }
+}
+
 export async function loadUploads(
   userId: string,
   dataKey: CryptoKey,
@@ -76,7 +104,7 @@ export async function loadUploads(
       continue
     }
     try {
-      const plain = await decryptBytes(dataKey, row.iv, await blobToCiphertextB64(blob))
+      const plain = await decryptStoredBlob(dataKey, row.iv, blob)
       files.push(rowToUploaded(row, plain))
     } catch {
       failures.push(row.name)

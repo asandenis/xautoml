@@ -130,6 +130,15 @@ export async function getRun(userId: string, runId: string): Promise<RunRecord |
   return data ? fromRow(data as RunRow) : null
 }
 
+export async function deleteRun(userId: string, runId: string): Promise<void> {
+  const { error } = await getSupabase()
+    .from('runs')
+    .delete()
+    .eq('user_id', userId)
+    .eq('id', runId)
+  if (error) throw new Error(error.message)
+}
+
 export async function countRunsToday(userId: string): Promise<number> {
   const start = new Date()
   start.setHours(0, 0, 0, 0)

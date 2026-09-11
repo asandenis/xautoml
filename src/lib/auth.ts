@@ -104,8 +104,36 @@ export async function restoreSession(): Promise<AuthSession | null> {
   const supabase = getSupabase()
   const { data, error } = await supabase.auth.getSession()
   if (error) throw new Error(error.message)
-  if (!data.session?.user) return null
-  return sessionFromUser(data.session.user)
+  if (data.session?.user) return sessionFromUser(data.session.user)
+
+  // Token refresh race: getSession can be empty briefly; getUser hits the server
+  const { data: userData, error: userError } = await supabase.auth.getUser()
+  if (userError || !userData.user) return null
+  return sessionFromUser(userData.user)
+}
+
+/** Subscribe to auth changes (incl. INITIAL_SESSION). Returns unsubscribe. */
+export function onAuthChange(
+  callback: (session: AuthSession | null) => void,
+): () => void {
+  if (!isSupabaseConfigured()) return () => {}
+  const supabase = getSupabase()
+  const {
+    data: { subscription },
+  } = supabase.auth.onAuthStateChange((_event, sess) => {
+    void (async () => {
+      if (!sess?.user) {
+        callback(null)
+        return
+      }
+      try {
+        callback(await sessionFromUser(sess.user))
+      } catch {
+        callback(null)
+      }
+    })()
+  })
+  return () => subscription.unsubscribe()
 }
 
 export async function registerWithPassword(
@@ -205,21 +233,4 @@ export async function setProfileStorage(userId: string, storageUsed: number) {
     .update({ storage_used: storageUsed })
     .eq('id', userId)
   if (error) throw new Error(error.message)
-}
-
-export function onAuthChange(handler: (session: AuthSession | null) => void) {
-  if (!isSupabaseConfigured()) return () => {}
-  const supabase = getSupabase()
-  const { data } = supabase.auth.onAuthStateChange(async (event, session) => {
-    if (!session?.user || event === 'SIGNED_OUT') {
-      handler(null)
-      return
-    }
-    try {
-      handler(await sessionFromUser(session.user))
-    } catch {
-      handler(null)
-    }
-  })
-  return () => data.subscription.unsubscribe()
 }

@@ -438,6 +438,14 @@ strong {
   list-style: none;
 }
 
+.run-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.5rem;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+}
+
 .run-item {
   width: 100%;
   display: grid;
@@ -445,10 +453,12 @@ strong {
   gap: 0.75rem;
   align-items: center;
   padding: 0.75rem 0;
-  border-bottom: 1px solid var(--line);
+  border: none;
+  background: transparent;
   text-align: left;
   color: var(--fg-muted);
   transition: color 0.2s ease, background 0.2s ease;
+  cursor: pointer;
 }
 
 .run-item:hover,
@@ -477,6 +487,21 @@ strong {
   color: var(--fg-muted);
 }
 
+.run-delete {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 0.72rem;
+  padding: 0.35rem 0.55rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.run-delete:hover {
+  color: var(--fg);
+  border-color: var(--fg);
+}
+
 @media (min-width: 720px) {
   .usage-grid {
     grid-template-columns: repeat(3, 1fr);
@@ -488,6 +513,15 @@ strong {
   .run-item {
     grid-template-columns: 1fr;
     gap: 0.2rem;
+  }
+
+  .run-row {
+    grid-template-columns: 1fr;
+  }
+
+  .run-delete {
+    justify-self: start;
+    margin-bottom: 0.5rem;
   }
 }
 

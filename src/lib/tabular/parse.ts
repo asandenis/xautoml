@@ -5,27 +5,61 @@ export type TabularColumn = {
   name: string
   role: 'dependent' | 'independent'
   missingPct: number
+  /** Cells that were text/symbols coerced to missing */
+  nonNumericPct: number
 }
 
 export type ParsedTable = {
   fileName: string
   headers: string[]
-  /** row-major numeric matrix; NaN for missing */
+  /** row-major numeric matrix; NaN for missing / non-numeric */
   rows: number[][]
   columns: TabularColumn[]
+  nonNumericCells: number
 }
 
 function isTabularFile(file: UploadedFile) {
   return file.kind === 'numerical' && ['csv', 'tsv', 'xlsx', 'xls'].includes(file.ext)
 }
 
-function toNumber(value: unknown): number {
-  if (value === null || value === undefined || value === '') return Number.NaN
-  if (typeof value === 'number') return Number.isFinite(value) ? value : Number.NaN
-  const cleaned = String(value).trim().replace(/,/g, '')
-  if (!cleaned) return Number.NaN
+/** Coerce cell to number; non-numeric / blank → NaN (treated as missing later). */
+function toNumber(value: unknown): { n: number; coerced: boolean } {
+  if (value === null || value === undefined) return { n: Number.NaN, coerced: false }
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? { n: value, coerced: false } : { n: Number.NaN, coerced: true }
+  }
+  if (typeof value === 'boolean') return { n: value ? 1 : 0, coerced: true }
+
+  let cleaned = String(value).trim()
+  if (!cleaned) return { n: Number.NaN, coerced: false }
+
+  const lower = cleaned.toLowerCase()
+  if (
+    lower === 'na' ||
+    lower === 'n/a' ||
+    lower === 'nan' ||
+    lower === 'null' ||
+    lower === 'none' ||
+    lower === '-' ||
+    lower === '--' ||
+    lower === '?' ||
+    lower === '#n/a' ||
+    lower === '#value!' ||
+    lower === '#div/0!'
+  ) {
+    return { n: Number.NaN, coerced: true }
+  }
+
+  // Strip currency / percent / spaces; keep digits, sign, decimal, exponent
+  const hadJunk = /[^0-9eE.+_\-\s,]/.test(cleaned) || /[%$€£¥]/.test(cleaned)
+  cleaned = cleaned
+    .replace(/[$€£¥%\s]/g, '')
+    .replace(/,/g, '')
+  if (!cleaned) return { n: Number.NaN, coerced: true }
+
   const n = Number(cleaned)
-  return Number.isFinite(n) ? n : Number.NaN
+  if (Number.isFinite(n)) return { n, coerced: hadJunk }
+  return { n: Number.NaN, coerced: true }
 }
 
 export async function parseTabularFile(file: UploadedFile): Promise<ParsedTable> {
@@ -58,20 +92,32 @@ export async function parseTabularFile(file: UploadedFile): Promise<ParsedTable>
     row.some((cell) => String(cell ?? '').trim() !== ''),
   )
 
+  let nonNumericCells = 0
   const rows = dataRows.map((row) =>
-    headers.map((_, colIdx) => toNumber(row[colIdx])),
+    headers.map((_, colIdx) => {
+      const raw = row[colIdx]
+      const blank = raw === null || raw === undefined || String(raw).trim() === ''
+      const { n } = toNumber(raw)
+      if (!blank && Number.isNaN(n)) nonNumericCells += 1
+      return n
+    }),
   )
 
-  // Validate mostly-numeric structure (allow some missing)
-  const numericCols = headers.map((_, colIdx) => {
-    const values = rows.map((r) => r[colIdx]!)
-    const valid = values.filter((v) => !Number.isNaN(v)).length
-    return valid / Math.max(1, values.length)
-  })
-  if (numericCols.some((ratio) => ratio < 0.5)) {
+  // Pool is numerical if enough cells parse as numbers; non-numeric → missing
+  const totalCells = rows.length * headers.length
+  const numericCells = rows.reduce(
+    (acc, row) => acc + row.filter((v) => !Number.isNaN(v)).length,
+    0,
+  )
+  if (totalCells === 0 || numericCells / totalCells < 0.25) {
     throw new Error(
-      'Expected numerical data under each header (row 1 names, rows 2+ numbers).',
+      'Expected mostly numerical data under each header (non-numeric cells are allowed and treated as missing).',
     )
+  }
+
+  const yValid = rows.filter((r) => !Number.isNaN(r[0])).length
+  if (yValid < 3) {
+    throw new Error('Dependent column (first) needs at least 3 numeric values.')
   }
 
   const columns: TabularColumn[] = headers.map((name, colIdx) => {
@@ -81,10 +127,11 @@ export async function parseTabularFile(file: UploadedFile): Promise<ParsedTable>
       name,
       role: colIdx === 0 ? 'dependent' : 'independent',
       missingPct: (missing / Math.max(1, values.length)) * 100,
+      nonNumericPct: (missing / Math.max(1, values.length)) * 100,
     }
   })
 
-  return { fileName: file.name, headers, rows, columns }
+  return { fileName: file.name, headers, rows, columns, nonNumericCells }
 }
 
 /** Pick the first CSV/XLSX that matches the numerical schema; otherwise null. */
